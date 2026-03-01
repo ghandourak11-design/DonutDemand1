@@ -1,0 +1,11 @@
+{
+  "byGuild": {
+    "1424138634512306410": {
+      "rewardsPanel": {
+        "title": "🎁 Claim Rewards",
+        "description": "Click **Claim Rewards** to submit your invite rewards.\n\nRequirements:\n• You must have **5+ invites**\n\nAfter submitting, your invites will be reset.",
+        "color": "#FF0000"
+      }
+    }
+  }
+}

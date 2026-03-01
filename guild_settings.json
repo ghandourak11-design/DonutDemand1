@@ -1,0 +1,16 @@
+{
+  "byGuild": {
+    "1424138634512306410": {
+      "staffRoleIds": [],
+      "vouchesChannelId": null,
+      "joinLogChannelId": null,
+      "customerRoleId": null,
+      "invitesBlacklist": [],
+      "rewardsWebhookUrl": null,
+      "automod": {
+        "enabled": true,
+        "bypassRoleName": "automod"
+      }
+    }
+  }
+}
