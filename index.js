@@ -1645,16 +1645,18 @@ client.on("interactionCreate", async (interaction) => {
         return interaction.reply({ content: "This only works inside tickets.", ephemeral: true });
       }
 
+      await interaction.deferReply({ ephemeral: true });
+
       const meta = getTicketMetaFromTopic(interaction.channel.topic);
       const openerId = meta?.openerId;
 
       const member = await interaction.guild.members.fetch(interaction.user.id).catch(() => null);
       const canClose = isOwner(interaction.user.id) || interaction.user.id === openerId || isStaff(member);
-      if (!canClose) return interaction.reply({ content: "Only the opener or staff can close this ticket.", ephemeral: true });
+      if (!canClose) return interaction.editReply({ content: "Only the opener or staff can close this ticket.", ephemeral: true });
 
       const reason = (interaction.fields.getTextInputValue("reason") || "").trim() || "No reason provided";
 
-      await interaction.reply({ content: "✅ Closing ticket...", ephemeral: true });
+      await interaction.editReply({ content: "✅ Closing ticket..." });
       await closeTicketFlow({
         channel: interaction.channel,
         guild: interaction.guild,
@@ -1714,13 +1716,15 @@ client.on("interactionCreate", async (interaction) => {
 
     /* ---------- Rewards panel configure modal submit ---------- */
     if (interaction.isModalSubmit() && interaction.customId === "rewards_panel_modal") {
+      await interaction.deferReply({ ephemeral: true });
+
       const member = await interaction.guild.members.fetch(interaction.user.id).catch(() => null);
       if (!member || !isAdminOrOwner(member)) {
-        return interaction.reply({ content: "Admins only.", ephemeral: true });
+        return interaction.editReply({ content: "Admins only.", ephemeral: true });
       }
 
       const text = (interaction.fields.getTextInputValue("text") || "").trim();
-      if (!text) return interaction.reply({ content: "❌ Panel text cannot be empty.", ephemeral: true });
+      if (!text) return interaction.editReply({ content: "❌ Panel text cannot be empty.", ephemeral: true });
 
       const cfg = getPanelConfig(interaction.guild.id);
       cfg.rewardsPanel ??= { text: null };
@@ -1733,11 +1737,11 @@ client.on("interactionCreate", async (interaction) => {
       // post in the same channel the command was used in (stored on interaction message context via channel)
       const targetChannel = interaction.channel;
       if (!targetChannel || targetChannel.type !== ChannelType.GuildText) {
-        return interaction.reply({ content: "❌ Invalid channel to post in.", ephemeral: true });
+        return interaction.editReply({ content: "❌ Invalid channel to post in.", ephemeral: true });
       }
 
       await targetChannel.send(buildRewardsPanelMessage(interaction.guild.id, cfg.rewardsPanel.text));
-      return interaction.reply({ content: "✅ Posted Claim Rewards panel.", ephemeral: true });
+      return interaction.editReply({ content: "✅ Posted Claim Rewards panel.", ephemeral: true });
     }
 
     /* ---------- Ticket modal submit ---------- */
