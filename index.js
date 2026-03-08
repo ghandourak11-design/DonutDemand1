@@ -17,10 +17,13 @@
  * - /settings set_rewards_webhook: save rewards webhook URL (per server)
  * - /panel rewards (admin): configure + post "Claim Rewards" panel (via modal)
  * - Claim Rewards button:
- *    - asks MC username + Discord username (via modal)
- *    - sends to webhook: discord user, mc user, discord name, invites at click time
- *    - THEN resets inviter’s invites (and cleans memberInviter refs)
- *    - replies ephemeral: invites reset, rewards paid to MC username after review
+ *   - ONLY allowed if user has at least 1 invite
+ *   - AND their most recent credited invite is older than 2 hours
+ *   - otherwise sends a dismissible ephemeral message
+ *   - asks MC username + Discord username (via modal)
+ *   - sends to webhook: discord user, mc user, discord name, invites at click time
+ *   - THEN resets inviter’s invites (and cleans memberInviter refs)
+ *   - replies ephemeral: invites reset, rewards paid to MC username after review
  */
 
 try {
@@ -139,7 +142,7 @@ function defaultGuildSettings() {
     // invite blacklist by userId (string)
     invitesBlacklist: [],
 
-    // NEW: rewards webhook (per-guild)
+    // rewards webhook (per-guild)
     rewardsWebhookUrl: null,
 
     automod: {
@@ -218,20 +221,15 @@ const DEFAULT_PANEL_CONFIG = {
     },
   ],
 
-  // NEW: optional rewards panel config (admin-managed)
   rewardsPanel: {
-    text: null, // string
+    text: null,
   },
 };
 
 function getPanelConfig(guildId) {
-  // Keep backward compatibility with older saved configs
   const cfg = panelStore.byGuild[guildId] || DEFAULT_PANEL_CONFIG;
-
-  // Ensure rewardsPanel exists without breaking existing configs
   cfg.rewardsPanel ??= { text: null };
   cfg.rewardsPanel.text ??= null;
-
   return cfg;
 }
 
@@ -328,7 +326,6 @@ function isValidWebhookUrl(url) {
 }
 
 async function sendWebhook(webhookUrl, payload) {
-  // Node 18+ has global fetch; Node 22 definitely does.
   const res = await fetch(webhookUrl, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -395,7 +392,6 @@ function invitesStillInServer(inviterId) {
   return Math.max(0, base + (s.manual || 0));
 }
 
-// Guild-aware (returns 0 if blacklisted)
 function invitesStillInServerForGuild(guildId, inviterId) {
   if (isBlacklistedInviter(guildId, inviterId)) return 0;
   return invitesStillInServer(inviterId);
@@ -414,12 +410,9 @@ async function refreshGuildInvites(guild) {
 
 /* ===================== RESET INVITES (CLAIM REWARDS) ===================== */
 function resetInvitesForUser(userId) {
-  // wipe stats + invited members
   invitesData.inviterStats[userId] = { joins: 0, rejoins: 0, left: 0, manual: 0 };
   delete invitesData.invitedMembers[userId];
 
-  // IMPORTANT: remove memberInviter mappings that point to this inviter,
-  // otherwise future leaves would keep subtracting from a reset inviter.
   for (const [memberId, inviterId] of Object.entries(invitesData.memberInviter || {})) {
     if (String(inviterId) === String(userId)) {
       delete invitesData.memberInviter[memberId];
@@ -623,6 +616,54 @@ function canOpenRewardsTicket(member) {
   if (joinedAt && ageMs <= TWO_HOURS) return { ok: true, reason: "joined within 2 hours" };
 
   return { ok: false, invites: inv };
+}
+
+/* ===================== REWARDS CLAIM GATE ===================== */
+function canClaimRewardsNow(guildId, userId) {
+  const invites = invitesStillInServerForGuild(guildId, userId);
+
+  if (invites < 1) {
+    return { ok: false, code: "NO_INVITES", invites };
+  }
+
+  const invitedMap = invitesData.invitedMembers?.[userId] || {};
+  const records = Object.values(invitedMap || {}).filter(Boolean);
+
+  if (!records.length) {
+    return { ok: false, code: "NO_HISTORY" };
+  }
+
+  const mostRecentJoinedAt = Math.max(
+    ...records
+      .map((r) => Number(r.joinedAt || 0))
+      .filter((n) => Number.isFinite(n) && n > 0)
+  );
+
+  if (!mostRecentJoinedAt || !Number.isFinite(mostRecentJoinedAt)) {
+    return { ok: false, code: "NO_HISTORY" };
+  }
+
+  const TWO_HOURS = 2 * 60 * 60 * 1000;
+  const ageMs = Date.now() - mostRecentJoinedAt;
+
+  if (ageMs < TWO_HOURS) {
+    const remainingMs = TWO_HOURS - ageMs;
+    const remainingHours = Math.max(1, Math.ceil(remainingMs / (60 * 60 * 1000)));
+
+    return {
+      ok: false,
+      code: "TOO_RECENT",
+      remainingMs,
+      remainingHours,
+      mostRecentJoinedAt,
+    };
+  }
+
+  return {
+    ok: true,
+    invites,
+    mostRecentJoinedAt,
+  };
 }
 
 /* ===================== STICKY + OPERATION TIMERS ===================== */
@@ -842,7 +883,6 @@ function toRpn(tokens) {
       continue;
     }
 
-    // unary minus -> inject 0
     if (op === "-") {
       const prev = i === 0 ? null : tokens[i - 1];
       const isUnary = !prev || (prev.type === "op" && prev.v !== ")") || (prev.type === "op" && prev.v === "(");
@@ -980,7 +1020,6 @@ function buildCommandsJSON() {
         .setDescription("Set the customer role used by /operation.")
         .addRoleOption((o) => o.setName("role").setDescription("Customer role").setRequired(true))
     )
-    // NEW: rewards webhook setting
     .addSubcommand((s) =>
       s
         .setName("set_rewards_webhook")
@@ -1023,7 +1062,6 @@ function buildCommandsJSON() {
     )
     .addSubcommand((sub) => sub.setName("show").setDescription("Show current saved ticket panel config (ephemeral)."))
     .addSubcommand((sub) => sub.setName("reset").setDescription("Reset ticket panel config back to default."))
-    // NEW: rewards panel (admin only) config + post via modal
     .addSubcommand((sub) =>
       sub.setName("rewards").setDescription("Admin: post a Claim Rewards panel (asks what the panel should say).")
     );
@@ -1087,7 +1125,6 @@ function buildCommandsJSON() {
     .setDMPermission(false)
     .addStringOption((o) => o.setName("expression").setDescription("Example: (5x2)+3^2/3").setRequired(true));
 
-  // NEW: leaderboard
   const leaderboardCmd = new SlashCommandBuilder()
     .setName("leaderboard")
     .setDescription("Shows the top 10 inviters in this server.")
@@ -1367,7 +1404,6 @@ client.on("guildMemberAdd", async (member) => {
 
     const blacklisted = isBlacklistedInviter(guild.id, creditedInviterId);
 
-    // Only track credit + counts if NOT blacklisted
     if (!blacklisted) {
       const stats = ensureInviterStats(creditedInviterId);
       if (invitesData.memberInviter[member.id]) stats.rejoins += 1;
@@ -1463,7 +1499,6 @@ async function closeTicketFlow({ channel, guild, closerUser, reason }) {
 
   const s = getGuildSettings(guild.id);
 
-  // DM opener (best-effort)
   try {
     if (openerId) {
       const openerUser = await client.users.fetch(openerId);
@@ -1483,7 +1518,6 @@ async function closeTicketFlow({ channel, guild, closerUser, reason }) {
     }
   } catch {}
 
-  // small message in ticket then delete
   try {
     await channel.send(`🔒 Ticket closing...`).catch(() => {});
   } catch {}
@@ -1547,6 +1581,29 @@ client.on("interactionCreate", async (interaction) => {
         });
       }
 
+      const gate = canClaimRewardsNow(interaction.guild.id, interaction.user.id);
+
+      if (!gate.ok) {
+        if (gate.code === "NO_INVITES") {
+          return interaction.reply({
+            content: "❌ You need at least **1 invite** before you can claim rewards.",
+            ephemeral: true,
+          });
+        }
+
+        if (gate.code === "TOO_RECENT") {
+          return interaction.reply({
+            content: `❌ You can claim rewards in **${gate.remainingHours} hour(s)**.`,
+            ephemeral: true,
+          });
+        }
+
+        return interaction.reply({
+          content: "❌ I couldn't verify your invite history yet. Please try again later.",
+          ephemeral: true,
+        });
+      }
+
       const modal = new ModalBuilder().setCustomId("rewards_claim_modal").setTitle("Claim Rewards");
 
       const mcInput = new TextInputBuilder()
@@ -1578,15 +1635,24 @@ client.on("interactionCreate", async (interaction) => {
         return interaction.editReply("❌ Rewards webhook is not configured. Ask an admin to set it with /settings set_rewards_webhook.");
       }
 
+      const gate = canClaimRewardsNow(interaction.guild.id, interaction.user.id);
+      if (!gate.ok) {
+        if (gate.code === "NO_INVITES") {
+          return interaction.editReply("❌ You need at least **1 invite** before you can claim rewards.");
+        }
+        if (gate.code === "TOO_RECENT") {
+          return interaction.editReply(`❌ You can claim rewards in **${gate.remainingHours} hour(s)**.`);
+        }
+        return interaction.editReply("❌ I couldn't verify your invite history yet. Please try again later.");
+      }
+
       const mc = (interaction.fields.getTextInputValue("mc") || "").trim();
       const discordName = (interaction.fields.getTextInputValue("discordname") || "").trim();
 
       if (!mc || !discordName) return interaction.editReply("❌ Please fill out all fields.");
 
-      // compute invites BEFORE reset
       const invitesBefore = invitesStillInServerForGuild(interaction.guild.id, interaction.user.id);
 
-      // send to webhook FIRST. If webhook fails, do NOT reset.
       const embed = new EmbedBuilder()
         .setTitle("🎁 Rewards Claim Submitted")
         .setColor(0xed4245)
@@ -1606,7 +1672,6 @@ client.on("interactionCreate", async (interaction) => {
         return interaction.editReply(`❌ Failed to submit claim to webhook: ${String(e?.message || e).slice(0, 180)}`);
       }
 
-      // reset invites AFTER successful webhook
       resetInvitesForUser(interaction.user.id);
 
       return interaction.editReply(
@@ -1671,7 +1736,6 @@ client.on("interactionCreate", async (interaction) => {
       const ticketType = resolveTicketType(config, typeId);
       if (!ticketType) return interaction.reply({ content: "This ticket type no longer exists.", ephemeral: true });
 
-      // Rewards ticket gate
       if (isRewardsTicket(ticketType)) {
         const member = await interaction.guild.members.fetch(interaction.user.id).catch(() => null);
         if (!member) return interaction.reply({ content: "Couldn't verify your server join/invites.", ephemeral: true });
@@ -1726,11 +1790,9 @@ client.on("interactionCreate", async (interaction) => {
       cfg.rewardsPanel ??= { text: null };
       cfg.rewardsPanel.text = text.slice(0, 4000);
 
-      // persist into panelStore
       panelStore.byGuild[interaction.guild.id] = cfg;
       savePanelStore();
 
-      // post in the same channel the command was used in (stored on interaction message context via channel)
       const targetChannel = interaction.channel;
       if (!targetChannel || targetChannel.type !== ChannelType.GuildText) {
         return interaction.reply({ content: "❌ Invalid channel to post in.", ephemeral: true });
@@ -1893,20 +1955,17 @@ client.on("interactionCreate", async (interaction) => {
     if (name === "leaderboard") {
       await interaction.deferReply({ ephemeral: false });
 
-      // Collect candidates from stored inviterStats keys.
       const ids = Object.keys(invitesData.inviterStats || {});
       if (!ids.length) return interaction.editReply("No invite data yet.");
 
-      // Compute counts for this guild (blacklist-aware), sort desc
       const scored = ids
         .map((id) => ({ id, count: invitesStillInServerForGuild(interaction.guild.id, id) }))
-        .filter((x) => x.count > 0) // hide zeros so it looks clean; remove this line if you want to show zeros too
+        .filter((x) => x.count > 0)
         .sort((a, b) => b.count - a.count)
         .slice(0, 10);
 
       if (!scored.length) return interaction.editReply("No inviters with invites yet.");
 
-      // Resolve tags best-effort
       const lines = [];
       for (let i = 0; i < scored.length; i++) {
         const entry = scored[i];
@@ -1947,7 +2006,6 @@ client.on("interactionCreate", async (interaction) => {
         if (!s.invitesBlacklist.includes(String(user.id))) s.invitesBlacklist.push(String(user.id));
         saveSettings();
 
-        // wipe their invite stats so they show 0 immediately
         resetInvitesForUser(user.id);
 
         return interaction.reply(`✅ Blacklisted ${user} — their invites will always stay **0**.`);
@@ -2029,7 +2087,6 @@ client.on("interactionCreate", async (interaction) => {
         return interaction.reply({ content: `✅ Customer role set to ${role}.`, ephemeral: true });
       }
 
-      // NEW: set rewards webhook
       if (sub === "set_rewards_webhook") {
         const url = interaction.options.getString("url", true).trim();
         if (!isValidWebhookUrl(url)) {
@@ -2096,7 +2153,6 @@ client.on("interactionCreate", async (interaction) => {
         const v = validatePanelConfig(newCfg);
         if (!v.ok) return interaction.reply({ content: `❌ ${v.msg}`, ephemeral: true });
 
-        // Preserve/merge rewards panel settings if not present
         newCfg.rewardsPanel ??= cfg.rewardsPanel ?? { text: null };
 
         panelStore.byGuild[interaction.guild.id] = newCfg;
@@ -2116,7 +2172,6 @@ client.on("interactionCreate", async (interaction) => {
         return interaction.reply({ content: "✅ Posted ticket panel.", ephemeral: true });
       }
 
-      // NEW: /panel rewards -> modal (ask what panel says) -> post panel -> save text
       if (sub === "rewards") {
         const modal = new ModalBuilder().setCustomId("rewards_panel_modal").setTitle("Rewards Panel");
 
@@ -2425,7 +2480,6 @@ client.on("interactionCreate", async (interaction) => {
           .catch(() => {});
       }
 
-      // delete ticket after timer
       if (activeOperations.has(interaction.channel.id)) {
         clearTimeout(activeOperations.get(interaction.channel.id));
         activeOperations.delete(interaction.channel.id);
@@ -2568,7 +2622,6 @@ client.on("messageCreate", async (message) => {
       const arg1 = parts[0];
       const text = message.content.slice(PREFIX.length + cmd.length + 1);
 
-      /* ---- !calc (NOT EPHEMERAL; it replies in channel) ---- */
       if (cmd === "calc") {
         if (!text || !text.trim()) {
           return message.reply("Usage: `!calc 10/2`, `!calc 5x6`, `!calc 2^5`, `!calc (5x2)+3`");
@@ -2583,7 +2636,6 @@ client.on("messageCreate", async (message) => {
         }
       }
 
-      /* ---- existing prefix fallback: !sync ---- */
       if (cmd === "sync" && isOwner(message.author.id)) {
         const mode = (parts[0] || "register_here").toLowerCase();
         try {
@@ -2673,7 +2725,6 @@ client.on("messageCreate", async (message) => {
       }
     }
 
-    // Sticky behavior
     const sticky = stickyByChannel.get(message.channel.id);
     if (sticky) {
       if (sticky.messageId && message.id === sticky.messageId) return;
