@@ -74,6 +74,8 @@ const INVITES_FILE = path.join(DATA_DIR, "invites_data.json");
 const INVITES_BACKUP_FILE = path.join(DATA_DIR, "invites_backup.json");
 const GIVEAWAYS_FILE = path.join(DATA_DIR, "giveaways_data.json");
 const BOT_STATE_FILE = path.join(DATA_DIR, "bot_state.json");
+const INVITES_AUTO_BACKUP_FILE = path.join(DATA_DIR, "invites_auto_backup.json");
+const BID_FILE = path.join(DATA_DIR, "bid_data.json");
 
 function loadJson(file, fallback) {
   try {
@@ -120,6 +122,10 @@ const botState = loadJson(BOT_STATE_FILE, { stoppedGuilds: {} });
 botState.stoppedGuilds ??= {};
 saveJson(BOT_STATE_FILE, botState);
 
+const bidData = loadJson(BID_FILE, { auctions: {} });
+bidData.auctions ??= {};
+saveJson(BID_FILE, bidData);
+
 function saveSettings() {
   saveJson(SETTINGS_FILE, settingsStore);
 }
@@ -134,6 +140,9 @@ function saveGiveaways() {
 }
 function saveSOS() {
   saveJson(SOS_FILE, sosData);
+}
+function saveBids() {
+  saveJson(BID_FILE, bidData);
 }
 function saveBotState() {
   saveJson(BOT_STATE_FILE, botState);
@@ -152,6 +161,9 @@ function defaultGuildSettings() {
 
     // rewards webhook (per-guild)
     rewardsWebhookUrl: null,
+
+    // notification channel for invite auto-backups
+    notificationChannelId: null,
 
     automod: {
       enabled: true,
@@ -172,6 +184,7 @@ function getGuildSettings(guildId) {
   s.customerRoleId ??= null;
   s.invitesBlacklist ??= [];
   s.rewardsWebhookUrl ??= null;
+  s.notificationChannelId ??= null;
   s.automod ??= { enabled: true, bypassRoleName: "automod" };
   s.automod.enabled ??= true;
   s.automod.bypassRoleName ??= "automod";
@@ -445,6 +458,23 @@ function doBackupInvites() {
   const snapshot = sanitizeInvitesDataForSave(invitesData);
   saveJson(INVITES_BACKUP_FILE, snapshot);
   return snapshot;
+}
+
+async function doAutoBackupInvites() {
+  const snapshot = sanitizeInvitesDataForSave(invitesData);
+  saveJson(INVITES_AUTO_BACKUP_FILE, snapshot);
+  console.log("✅ Auto-backed up invites");
+
+  // Notify all guilds that have a notification channel configured
+  for (const [guildId, s] of Object.entries(settingsStore.byGuild || {})) {
+    if (!s.notificationChannelId) continue;
+    try {
+      const ch = await client.channels.fetch(s.notificationChannelId).catch(() => null);
+      if (ch && ch.type === ChannelType.GuildText) {
+        await ch.send("✅ Invites have been auto-backed up!").catch(() => {});
+      }
+    } catch {}
+  }
 }
 
 function doRestoreInvites() {
@@ -1307,6 +1337,44 @@ function buildRewardsPanelMessage(guildId, text) {
   return { embeds: [embed], components: [row] };
 }
 
+/* ===================== BID AUCTION ===================== */
+function makeBidEmbed(auction) {
+  const bidderText = auction.currentBidderId ? `<@${auction.currentBidderId}>` : "No bids yet";
+  const bidText = auction.currentBidderId ? `**$${auction.currentBid}**` : `**$${auction.startingPrice}** (No bids yet)`;
+  return new EmbedBuilder()
+    .setTitle(`🔨 Auction — ${auction.item}`)
+    .setColor(0xf1c40f)
+    .addFields(
+      { name: "Item", value: String(auction.item).slice(0, 1024), inline: true },
+      { name: "Current Bid", value: bidText, inline: true },
+      { name: "Highest Bidder", value: bidderText, inline: true },
+      { name: "Max Bid", value: `**$${auction.maxBid}**`, inline: true },
+      { name: "Hosted by", value: `<@${auction.hostId}>`, inline: true }
+    )
+    .setFooter({ text: `Auction ID: ${auction.messageId}` })
+    .setTimestamp();
+}
+
+function buildBidRow(messageId, ended) {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`bid_plus1:${messageId}`)
+      .setStyle(ButtonStyle.Success)
+      .setLabel("+$1")
+      .setDisabled(Boolean(ended)),
+    new ButtonBuilder()
+      .setCustomId(`bid_custom:${messageId}`)
+      .setStyle(ButtonStyle.Primary)
+      .setLabel("Custom Bid")
+      .setDisabled(Boolean(ended)),
+    new ButtonBuilder()
+      .setCustomId(`bid_end:${messageId}`)
+      .setStyle(ButtonStyle.Danger)
+      .setLabel("End Auction")
+      .setDisabled(Boolean(ended))
+  );
+}
+
 /* ===================== SLASH COMMANDS REGISTRATION ===================== */
 function buildCommandsJSON() {
   const settingsCmd = new SlashCommandBuilder()
@@ -1583,6 +1651,33 @@ function buildCommandsJSON() {
       o.setName("min_invites").setDescription("Minimum invites needed to enter (optional)").setMinValue(0).setRequired(false)
     );
 
+  const redeemCmd = new SlashCommandBuilder()
+    .setName("redeem")
+    .setDescription("Restore your invites from the auto-backup after a bot reset.")
+    .setDMPermission(false);
+
+  const bidCmd = new SlashCommandBuilder()
+    .setName("bid")
+    .setDescription("Start an auction (staff only).")
+    .setDMPermission(false)
+    .addStringOption((o) => o.setName("item").setDescription("What's being auctioned").setRequired(true))
+    .addIntegerOption((o) => o.setName("starting_price").setDescription("Starting bid amount").setMinValue(1).setRequired(true))
+    .addIntegerOption((o) => o.setName("max_bid").setDescription("Maximum allowed bid amount").setMinValue(1).setRequired(true));
+
+  const addCmd = new SlashCommandBuilder()
+    .setName("add")
+    .setDescription("Add a user to the current ticket.")
+    .setDMPermission(false)
+    .addUserOption((o) => o.setName("user").setDescription("User to add to this ticket").setRequired(true));
+
+  const notificationCmd = new SlashCommandBuilder()
+    .setName("notification")
+    .setDescription("Admin: set the channel where invite auto-backup notifications are sent.")
+    .setDMPermission(false)
+    .addChannelOption((o) =>
+      o.setName("channel").setDescription("Channel to send backup notifications in").addChannelTypes(ChannelType.GuildText).setRequired(true)
+    );
+
   return [
     settingsCmd,
     panelCmd,
@@ -1600,6 +1695,10 @@ function buildCommandsJSON() {
     opCmd,
     ...giveawayCmds,
     sosCmd,
+    redeemCmd,
+    bidCmd,
+    addCmd,
+    notificationCmd,
   ].map((c) => c.toJSON());
 }
 
@@ -1691,6 +1790,10 @@ client.once("ready", async () => {
       redrawSOSPlayers(messageId).catch(() => {});
     }
   }
+
+  // Auto-backup invites every hour
+  doAutoBackupInvites().catch(() => {});
+  setInterval(() => doAutoBackupInvites().catch(() => {}), 60 * 60 * 1000);
 });
 
 client.on("guildCreate", async (guild) => {
@@ -1950,7 +2053,160 @@ client.on("interactionCreate", async (interaction) => {
       return interaction.reply({ content: idx === -1 ? "✅ Entered the game!" : "✅ Removed your entry.", ephemeral: true });
     }
 
-    /* ---------- Rewards claim button -> modal ---------- */
+    /* ---------- Bid +$1 button ---------- */
+    if (interaction.isButton() && interaction.customId.startsWith("bid_plus1:")) {
+      const messageId = interaction.customId.split("bid_plus1:")[1];
+      const auction = bidData.auctions[messageId];
+      if (!auction) return interaction.reply({ content: "This auction no longer exists.", ephemeral: true });
+      if (auction.ended) return interaction.reply({ content: "This auction has already ended.", ephemeral: true });
+
+      const newBid = auction.currentBid + 1;
+      if (newBid > auction.maxBid) {
+        return interaction.reply({ content: `❌ That would exceed the max bid of $${auction.maxBid}.`, ephemeral: true });
+      }
+      if (auction.currentBidderId === interaction.user.id) {
+        return interaction.reply({ content: "You're already the highest bidder!", ephemeral: true });
+      }
+
+      auction.currentBid = newBid;
+      auction.currentBidderId = interaction.user.id;
+      saveBids();
+
+      const ch = await client.channels.fetch(auction.channelId).catch(() => null);
+      if (ch) {
+        const msg = await ch.messages.fetch(auction.messageId).catch(() => null);
+        if (msg) await msg.edit({ embeds: [makeBidEmbed(auction)], components: [buildBidRow(auction.messageId, false)] }).catch(() => {});
+      }
+
+      return interaction.reply({ content: `✅ You bid $${newBid}!`, ephemeral: true });
+    }
+
+    /* ---------- Bid custom button -> modal ---------- */
+    if (interaction.isButton() && interaction.customId.startsWith("bid_custom:")) {
+      const messageId = interaction.customId.split("bid_custom:")[1];
+      const auction = bidData.auctions[messageId];
+      if (!auction || auction.ended) return interaction.reply({ content: "This auction has already ended.", ephemeral: true });
+
+      const modal = new ModalBuilder().setCustomId(`bid_custom_modal:${messageId}`).setTitle("Custom Bid");
+      const input = new TextInputBuilder()
+        .setCustomId("bid_amount")
+        .setLabel("Enter your bid amount (number)")
+        .setStyle(TextInputStyle.Short)
+        .setRequired(true)
+        .setMaxLength(10);
+
+      modal.addComponents(new ActionRowBuilder().addComponents(input));
+      return interaction.showModal(modal);
+    }
+
+    /* ---------- Bid custom modal submit ---------- */
+    if (interaction.isModalSubmit() && interaction.customId.startsWith("bid_custom_modal:")) {
+      const messageId = interaction.customId.split("bid_custom_modal:")[1];
+      const auction = bidData.auctions[messageId];
+      if (!auction || auction.ended) return interaction.reply({ content: "This auction has already ended.", ephemeral: true });
+
+      const raw = (interaction.fields.getTextInputValue("bid_amount") || "").trim();
+      const amount = parseInt(raw, 10);
+
+      if (isNaN(amount) || amount <= 0) return interaction.reply({ content: "❌ Invalid bid amount.", ephemeral: true });
+      if (amount <= auction.currentBid) {
+        return interaction.reply({ content: `❌ Your bid must be higher than the current bid of $${auction.currentBid}.`, ephemeral: true });
+      }
+      if (amount > auction.maxBid) {
+        return interaction.reply({ content: `❌ Your bid cannot exceed the max bid of $${auction.maxBid}.`, ephemeral: true });
+      }
+
+      auction.currentBid = amount;
+      auction.currentBidderId = interaction.user.id;
+      saveBids();
+
+      const ch = await client.channels.fetch(auction.channelId).catch(() => null);
+      if (ch) {
+        const msg = await ch.messages.fetch(auction.messageId).catch(() => null);
+        if (msg) await msg.edit({ embeds: [makeBidEmbed(auction)], components: [buildBidRow(auction.messageId, false)] }).catch(() => {});
+      }
+
+      return interaction.reply({ content: `✅ You bid $${amount}!`, ephemeral: true });
+    }
+
+    /* ---------- Bid end auction button ---------- */
+    if (interaction.isButton() && interaction.customId.startsWith("bid_end:")) {
+      const messageId = interaction.customId.split("bid_end:")[1];
+      const auction = bidData.auctions[messageId];
+      if (!auction) return interaction.reply({ content: "This auction no longer exists.", ephemeral: true });
+      if (auction.ended) return interaction.reply({ content: "This auction has already ended.", ephemeral: true });
+
+      const member = await interaction.guild.members.fetch(interaction.user.id).catch(() => null);
+      if (!member || (!isOwner(interaction.user.id) && !isStaff(member))) {
+        return interaction.reply({ content: "Only staff can end the auction.", ephemeral: true });
+      }
+
+      auction.ended = true;
+      saveBids();
+
+      const ch = await client.channels.fetch(auction.channelId).catch(() => null);
+      if (ch) {
+        const msg = await ch.messages.fetch(auction.messageId).catch(() => null);
+        if (msg) await msg.edit({ embeds: [makeBidEmbed(auction)], components: [buildBidRow(auction.messageId, true)] }).catch(() => {});
+      }
+
+      await interaction.deferReply({ ephemeral: true });
+
+      if (!auction.currentBidderId) {
+        if (ch) await ch.send("No bids — auction ended with no winner.").catch(() => {});
+        return interaction.editReply("✅ Auction ended with no winner.");
+      }
+
+      const guild = interaction.guild;
+      const winnerMember = await guild.members.fetch(auction.currentBidderId).catch(() => null);
+      const winnerName = winnerMember?.displayName || `<@${auction.currentBidderId}>`;
+
+      if (ch) {
+        await ch
+          .send(`🏆 Auction ended! **${winnerName}** won **${auction.item}** with a bid of **$${auction.currentBid}**!`)
+          .catch(() => {});
+      }
+
+      // Create winner ticket
+      const s = getGuildSettings(guild.id);
+      const category = await getOrCreateCategory(guild, "Auctions").catch(() => null);
+      const winnerId = auction.currentBidderId;
+      const channelName = `bid-${cleanName(winnerMember?.user.username || winnerId)}`;
+      const createdAt = Date.now();
+
+      const overwrites = [
+        { id: guild.roles.everyone.id, deny: [PermissionsBitField.Flags.ViewChannel] },
+        {
+          id: winnerId,
+          allow: [PermissionsBitField.Flags.ViewChannel, PermissionsBitField.Flags.SendMessages, PermissionsBitField.Flags.ReadMessageHistory],
+        },
+        ...(s.staffRoleIds || []).map((rid) => ({
+          id: rid,
+          allow: [PermissionsBitField.Flags.ViewChannel, PermissionsBitField.Flags.SendMessages, PermissionsBitField.Flags.ReadMessageHistory],
+        })),
+      ];
+
+      const ticketChannel = await guild.channels
+        .create({
+          name: channelName,
+          type: ChannelType.GuildText,
+          parent: category?.id,
+          topic: `opener:${winnerId};created:${createdAt};type:bid_winner`,
+          permissionOverwrites: overwrites,
+        })
+        .catch(() => null);
+
+      if (ticketChannel) {
+        await ticketChannel
+          .send({
+            content: `<@${winnerId}> — You won the auction for **${auction.item}** at **$${auction.currentBid}**! A staff member will help you complete the trade.`,
+            components: [buildTicketControlRow()],
+          })
+          .catch(() => {});
+      }
+
+      return interaction.editReply("✅ Auction ended. Winner ticket created.");
+    }
     if (interaction.isButton() && interaction.customId === "rewards_claim_btn") {
       const s = getGuildSettings(interaction.guild.id);
       if (!s.rewardsWebhookUrl) {
@@ -3001,6 +3257,125 @@ client.on("interactionCreate", async (interaction) => {
       scheduleSOSEnd(game.messageId);
       return;
     }
+
+    /* ---------- /redeem ---------- */
+    if (name === "redeem") {
+      const userId = interaction.user.id;
+      const backup = loadJson(INVITES_AUTO_BACKUP_FILE, null);
+
+      if (!backup || !backup.inviterStats?.[userId]) {
+        return interaction.reply({ content: "❌ No backup data found for you.", ephemeral: true });
+      }
+
+      const currentCount = invitesStillInServer(userId);
+      if (currentCount > 0) {
+        return interaction.reply({ content: "You already have invites. No restore needed.", ephemeral: true });
+      }
+
+      // Restore inviterStats for this user
+      invitesData.inviterStats[userId] = { ...backup.inviterStats[userId] };
+
+      // Restore memberInviter entries credited to this user
+      for (const [memberId, inviterId] of Object.entries(backup.memberInviter || {})) {
+        if (String(inviterId) === String(userId)) {
+          invitesData.memberInviter[memberId] = inviterId;
+        }
+      }
+
+      // Restore invitedMembers for this user
+      if (backup.invitedMembers?.[userId]) {
+        invitesData.invitedMembers[userId] = { ...backup.invitedMembers[userId] };
+      }
+
+      saveInvites();
+
+      const newCount = invitesStillInServer(userId);
+      return interaction.reply({ content: `✅ Your invites have been restored! You now have **${newCount}** invites.`, ephemeral: true });
+    }
+
+    /* ---------- /bid ---------- */
+    if (name === "bid") {
+      const member = await interaction.guild.members.fetch(interaction.user.id).catch(() => null);
+      if (!member || (!isOwner(interaction.user.id) && !isStaff(member))) {
+        return interaction.reply({ content: "Staff only (configure staff roles in /settings).", ephemeral: true });
+      }
+
+      const item = interaction.options.getString("item", true).trim();
+      const startingPrice = interaction.options.getInteger("starting_price", true);
+      const maxBid = interaction.options.getInteger("max_bid", true);
+
+      if (!item) return interaction.reply({ content: "Item cannot be empty.", ephemeral: true });
+      if (maxBid < startingPrice) {
+        return interaction.reply({ content: "Max bid must be at least the starting price.", ephemeral: true });
+      }
+
+      const auction = {
+        guildId: interaction.guild.id,
+        channelId: interaction.channel.id,
+        messageId: null,
+        item,
+        startingPrice,
+        maxBid,
+        hostId: interaction.user.id,
+        currentBid: startingPrice,
+        currentBidderId: null,
+        ended: false,
+      };
+
+      const sent = await interaction.reply({
+        embeds: [makeBidEmbed({ ...auction, messageId: "pending" })],
+        components: [buildBidRow("pending", false)],
+        fetchReply: true,
+      });
+
+      auction.messageId = sent.id;
+      bidData.auctions[auction.messageId] = auction;
+      saveBids();
+
+      await sent.edit({ embeds: [makeBidEmbed(auction)], components: [buildBidRow(auction.messageId, false)] }).catch(() => {});
+      return;
+    }
+
+    /* ---------- /add ---------- */
+    if (name === "add") {
+      if (!isTicketChannel(interaction.channel)) {
+        return interaction.reply({ content: "Use **/add** inside a ticket channel.", ephemeral: true });
+      }
+
+      const meta = getTicketMetaFromTopic(interaction.channel.topic);
+      const openerId = meta?.openerId;
+
+      const member = await interaction.guild.members.fetch(interaction.user.id).catch(() => null);
+      const canAdd = isOwner(interaction.user.id) || interaction.user.id === openerId || isStaff(member);
+      if (!canAdd) {
+        return interaction.reply({ content: "Only the ticket opener or staff can add users.", ephemeral: true });
+      }
+
+      const targetUser = interaction.options.getUser("user", true);
+
+      await interaction.channel.permissionOverwrites.create(targetUser.id, {
+        ViewChannel: true,
+        SendMessages: true,
+        ReadMessageHistory: true,
+      });
+
+      return interaction.reply({ content: `✅ Added ${targetUser} to this ticket.` });
+    }
+
+    /* ---------- /notification ---------- */
+    if (name === "notification") {
+      const member = await interaction.guild.members.fetch(interaction.user.id).catch(() => null);
+      if (!member || !isAdminOrOwner(member)) {
+        return interaction.reply({ content: "Admins only.", ephemeral: true });
+      }
+
+      const channel = interaction.options.getChannel("channel", true);
+      const s = getGuildSettings(interaction.guild.id);
+      s.notificationChannelId = channel.id;
+      saveSettings();
+
+      return interaction.reply({ content: `✅ Invite backup notifications will be sent to ${channel}.`, ephemeral: true });
+    }
   } catch (e) {
     console.error("interaction error:", e);
     try {
@@ -3035,11 +3410,25 @@ client.on("messageCreate", async (message) => {
 
           await message.reply(`✅ Got it! You chose **${answer}**. Waiting for the other player...`).catch(() => {});
 
-          // Update main channel embed with new response count
+          // Get player display names for channel progress messages
+          const guild = client.guilds.cache.get(game.guildId) || (await client.guilds.fetch(game.guildId).catch(() => null));
+          const [p1, p2] = game.players;
+          const otherPlayerId = message.author.id === p1 ? p2 : p1;
+          const responderMember = guild ? await guild.members.fetch(message.author.id).catch(() => null) : null;
+          const otherMember = guild ? await guild.members.fetch(otherPlayerId).catch(() => null) : null;
+          const responderName = responderMember?.displayName || message.author.username;
+          const otherName = otherMember?.displayName || `<@${otherPlayerId}>`;
+
+          // Send channel progress message and update embed
           try {
             const ch = await client.channels.fetch(game.channelId);
-            const msg = await ch.messages.fetch(game.messageId);
-            await msg.edit({ embeds: [makeSosWaitingEmbed(game)], components: [sosRow(game)] });
+            if (game.responsesCount === 1) {
+              await ch.send(`🎲 **${responderName}** has responded! Waiting on **${otherName}**... (1/2)`).catch(() => {});
+            } else {
+              await ch.send(`🎲 Both players have responded! (2/2)`).catch(() => {});
+            }
+            const msg = await ch.messages.fetch(game.messageId).catch(() => null);
+            if (msg) await msg.edit({ embeds: [makeSosWaitingEmbed(game)], components: [sosRow(game)] }).catch(() => {});
           } catch {}
 
           // If both responded, resolve immediately
