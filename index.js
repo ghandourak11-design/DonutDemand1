@@ -111,6 +111,11 @@ const giveawayData = loadJson(GIVEAWAYS_FILE, { giveaways: {} });
 giveawayData.giveaways ??= {};
 saveJson(GIVEAWAYS_FILE, giveawayData);
 
+const SOS_FILE = path.join(DATA_DIR, "sos_data.json");
+const sosData = loadJson(SOS_FILE, { games: {} });
+sosData.games ??= {};
+saveJson(SOS_FILE, sosData);
+
 const botState = loadJson(BOT_STATE_FILE, { stoppedGuilds: {} });
 botState.stoppedGuilds ??= {};
 saveJson(BOT_STATE_FILE, botState);
@@ -126,6 +131,9 @@ function saveInvites() {
 }
 function saveGiveaways() {
   saveJson(GIVEAWAYS_FILE, giveawayData);
+}
+function saveSOS() {
+  saveJson(SOS_FILE, sosData);
 }
 function saveBotState() {
   saveJson(BOT_STATE_FILE, botState);
@@ -241,8 +249,9 @@ const client = new Client({
     GatewayIntentBits.GuildMembers,
     GatewayIntentBits.GuildMessages,
     GatewayIntentBits.MessageContent,
+    GatewayIntentBits.DirectMessages,
   ],
-  partials: [Partials.Channel],
+  partials: [Partials.Channel, Partials.Message],
 });
 
 /* ===================== SMALL HELPERS ===================== */
@@ -798,6 +807,260 @@ function scheduleGiveawayEnd(messageId) {
   }, Math.min(delay, MAX));
 }
 
+/* ===================== SPLIT OR STEAL ===================== */
+
+// In-memory map: userId -> sosMessageId (tracks who needs to respond via DM)
+const pendingSOSDMs = new Map();
+
+function makeSosEmbed(game) {
+  const endUnix = Math.floor(game.endsAt / 1000);
+  const minInv = game.minInvites > 0 ? `\nMin invites to join: **${game.minInvites}**` : "";
+  const status = game.ended ? "\n**STATUS: ENDED**" : "";
+  return new EmbedBuilder()
+    .setTitle(`🎲 SPLIT OR STEAL — ${game.title}`)
+    .setColor(0x9b59b6)
+    .setDescription(
+      `Prize: **${game.prize}**\n` +
+        `Ends: <t:${endUnix}:R> (<t:${endUnix}:F>)\n` +
+        `Hosted by: <@${game.hostId}>\n` +
+        `Entries: **${game.entries.length}**` +
+        minInv +
+        status
+    )
+    .setFooter({ text: `Split or Steal • Message ID: ${game.messageId}` })
+    .setTimestamp();
+}
+
+function makeSosWaitingEmbed(game) {
+  const [p1, p2] = game.players;
+  return new EmbedBuilder()
+    .setTitle(`🎲 SPLIT OR STEAL — ${game.title}`)
+    .setColor(0xe67e22)
+    .setDescription(
+      `Prize: **${game.prize}**\n` +
+        `Hosted by: <@${game.hostId}>\n\n` +
+        `⏳ Waiting for <@${p1}> and <@${p2}> to decide...\n` +
+        `Responses: **${game.responsesCount}/2**`
+    )
+    .setFooter({ text: `Split or Steal • Message ID: ${game.messageId}` })
+    .setTimestamp();
+}
+
+function sosRow(game) {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`sos_join:${game.messageId}`)
+      .setStyle(ButtonStyle.Primary)
+      .setEmoji("🎲")
+      .setLabel(game.ended ? "Game Ended" : "Enter / Leave")
+      .setDisabled(Boolean(game.ended))
+  );
+}
+
+async function resolveSOSGame(messageId) {
+  const game = sosData.games[messageId];
+  if (!game || game.resolved) return;
+
+  game.resolved = true;
+  saveSOS();
+
+  for (const userId of game.players || []) {
+    pendingSOSDMs.delete(userId);
+  }
+
+  const channel = await client.channels.fetch(game.channelId).catch(() => null);
+
+  if (game.discussionChannelId) {
+    setTimeout(async () => {
+      const dc = await client.channels.fetch(game.discussionChannelId).catch(() => null);
+      if (dc) await dc.delete().catch(() => {});
+    }, 3000);
+  }
+
+  if (!channel) return;
+
+  const [p1, p2] = game.players;
+  const c1 = game.responses[p1] || "STEAL";
+  const c2 = game.responses[p2] || "STEAL";
+
+  let outcome, color;
+  if (c1 === "SPLIT" && c2 === "SPLIT") {
+    outcome = `🤝 **Both Split!** Both players get half the prize.\n<@${p1}> and <@${p2}> each receive half of **${game.prize}**!`;
+    color = 0x2ecc71;
+  } else if (c1 === "STEAL" && c2 === "STEAL") {
+    outcome = `💀 **Both Steal!** Nobody wins.\nBoth players chose to steal — nobody gets anything.`;
+    color = 0x95a5a6;
+  } else if (c1 === "STEAL") {
+    outcome = `😈 **<@${p1}> stole everything!** <@${p2}> gets nothing.\n<@${p1}> walks away with **${game.prize}**!`;
+    color = 0xe74c3c;
+  } else {
+    outcome = `😈 **<@${p2}> stole everything!** <@${p1}> gets nothing.\n<@${p2}> walks away with **${game.prize}**!`;
+    color = 0xe74c3c;
+  }
+
+  const resultsEmbed = new EmbedBuilder()
+    .setTitle(`🎲 Split or Steal Results — ${game.title}`)
+    .setColor(color)
+    .setDescription(`**Prize:** ${game.prize}\n\n${outcome}`)
+    .addFields(
+      { name: "Player 1", value: `<@${p1}>\n${c1 === "SPLIT" ? "🤝 SPLIT" : "😈 STEAL"}`, inline: true },
+      { name: "Player 2", value: `<@${p2}>\n${c2 === "SPLIT" ? "🤝 SPLIT" : "😈 STEAL"}`, inline: true }
+    )
+    .setFooter({ text: `Split or Steal • Hosted by: ${game.hostId}` })
+    .setTimestamp();
+
+  await channel.send({ embeds: [resultsEmbed] }).catch(() => {});
+}
+
+async function endSOS(messageId) {
+  const game = sosData.games[messageId];
+  if (!game || game.ended) return;
+
+  game.ended = true;
+  saveSOS();
+
+  const channel = await client.channels.fetch(game.channelId).catch(() => null);
+  if (!channel) return;
+
+  const msg = await channel.messages.fetch(game.messageId).catch(() => null);
+  if (msg) await msg.edit({ embeds: [makeSosEmbed(game)], components: [sosRow(game)] }).catch(() => {});
+
+  if (game.entries.length < 2) {
+    await channel.send(`🎲 Split or Steal ended — not enough entries (need at least 2). **${game.title}** cancelled.`).catch(() => {});
+    return;
+  }
+
+  const players = pickRandomWinners(game.entries, 2);
+  game.players = players;
+  game.responses = {};
+  game.responsesCount = 0;
+  game.drawn = true;
+  game.resolved = false;
+  saveSOS();
+
+  const [p1, p2] = players;
+
+  const s = getGuildSettings(game.guildId);
+  const guild = client.guilds.cache.get(game.guildId) || (await client.guilds.fetch(game.guildId).catch(() => null));
+
+  let discussionChannel = null;
+  if (guild) {
+    const overwrites = [
+      { id: guild.roles.everyone.id, deny: [PermissionsBitField.Flags.ViewChannel] },
+      {
+        id: p1,
+        allow: [PermissionsBitField.Flags.ViewChannel, PermissionsBitField.Flags.SendMessages, PermissionsBitField.Flags.ReadMessageHistory],
+      },
+      {
+        id: p2,
+        allow: [PermissionsBitField.Flags.ViewChannel, PermissionsBitField.Flags.SendMessages, PermissionsBitField.Flags.ReadMessageHistory],
+      },
+      ...(s.staffRoleIds || []).map((rid) => ({
+        id: rid,
+        allow: [PermissionsBitField.Flags.ViewChannel, PermissionsBitField.Flags.SendMessages, PermissionsBitField.Flags.ReadMessageHistory],
+      })),
+    ];
+    discussionChannel = await guild.channels
+      .create({
+        name: `sos-${messageId.slice(-6)}`,
+        type: ChannelType.GuildText,
+        topic: `Split or Steal discussion — game ${messageId}`,
+        permissionOverwrites: overwrites,
+      })
+      .catch(() => null);
+  }
+
+  if (discussionChannel) {
+    game.discussionChannelId = discussionChannel.id;
+    saveSOS();
+    await discussionChannel
+      .send({
+        embeds: [
+          new EmbedBuilder()
+            .setTitle(`🎲 Split or Steal — ${game.title}`)
+            .setColor(0x9b59b6)
+            .setDescription(
+              `<@${p1}> and <@${p2}> — you two have been selected!\n\n` +
+                `**Prize:** ${game.prize}\n\n` +
+                `Check your DMs! You have **2 minutes** to reply with \`SPLIT\` or \`STEAL\`.\n\n` +
+                `Use this channel to discuss your strategy before deciding.`
+            ),
+        ],
+      })
+      .catch(() => {});
+  }
+
+  if (msg) await msg.edit({ embeds: [makeSosWaitingEmbed(game)], components: [sosRow(game)] }).catch(() => {});
+
+  // DM both players and track pending responses in one pass
+  for (const userId of players) {
+    try {
+      const user = await client.users.fetch(userId);
+      await user.send(
+        `🎲 **You've been selected for Split or Steal!**\n\n` +
+          `**Game:** ${game.title}\n` +
+          `**Prize:** ${game.prize}\n\n` +
+          `Do you want to **SPLIT** or **STEAL**?\n` +
+          `Reply with \`SPLIT\` or \`STEAL\` within **2 minutes**.\n\n` +
+          `⚠️ If you don't respond in time, you'll default to **STEAL**.`
+      );
+      // DM succeeded — register for DM collection
+      pendingSOSDMs.set(userId, messageId);
+    } catch {
+      // DMs closed — default to STEAL immediately
+      game.responses[userId] = "STEAL";
+      game.responsesCount++;
+    }
+  }
+  saveSOS();
+
+  // If both already defaulted (DMs closed), resolve immediately
+  if (game.responsesCount >= 2) {
+    await resolveSOSGame(messageId);
+    return;
+  }
+
+  // Update waiting embed to reflect any instant defaults
+  if (msg) await msg.edit({ embeds: [makeSosWaitingEmbed(game)], components: [sosRow(game)] }).catch(() => {});
+
+  // 2-minute timeout — non-responders default to STEAL
+  setTimeout(async () => {
+    const g = sosData.games[messageId];
+    if (!g || g.resolved) return;
+    defaultNonResponders(g);
+    await resolveSOSGame(messageId);
+  }, 2 * 60 * 1000);
+}
+
+function defaultNonResponders(game) {
+  let changed = false;
+  for (const userId of game.players || []) {
+    if (!game.responses[userId]) {
+      game.responses[userId] = "STEAL";
+      game.responsesCount++;
+      pendingSOSDMs.delete(userId);
+      changed = true;
+    }
+  }
+  if (changed) saveSOS();
+}
+
+function scheduleSOSEnd(messageId) {
+  const game = sosData.games[messageId];
+  if (!game || game.ended) return;
+
+  const delay = game.endsAt - Date.now();
+  if (delay <= 0) return void endSOS(messageId).catch(() => {});
+
+  const MAX = 2_147_483_647;
+  setTimeout(() => {
+    const g = sosData.games[messageId];
+    if (!g || g.ended) return;
+    if (g.endsAt - Date.now() > MAX) return scheduleSOSEnd(messageId);
+    endSOS(messageId).catch(() => {});
+  }, Math.min(delay, MAX));
+}
+
 /* ===================== SAFE CALCULATOR (!calc + /calc) ===================== */
 function tokenizeCalc(input) {
   const s = String(input || "")
@@ -1239,6 +1502,17 @@ function buildCommandsJSON() {
       .addStringOption((o) => o.setName("message").setDescription("Giveaway message ID or link").setRequired(true)),
   ];
 
+  const sosCmd = new SlashCommandBuilder()
+    .setName("sos")
+    .setDescription("Start a Split or Steal game.")
+    .setDMPermission(false)
+    .addStringOption((o) => o.setName("title").setDescription("Title for the Split or Steal game").setRequired(true))
+    .addStringOption((o) => o.setName("prize").setDescription("What's being given away").setRequired(true))
+    .addStringOption((o) => o.setName("duration").setDescription("How long entries are open (e.g. 30m, 1h, 2d)").setRequired(true))
+    .addIntegerOption((o) =>
+      o.setName("min_invites").setDescription("Minimum invites needed to enter (optional)").setMinValue(0).setRequired(false)
+    );
+
   return [
     settingsCmd,
     panelCmd,
@@ -1255,6 +1529,7 @@ function buildCommandsJSON() {
     closeCmd,
     opCmd,
     ...giveawayCmds,
+    sosCmd,
   ].map((c) => c.toJSON());
 }
 
@@ -1334,6 +1609,18 @@ client.once("ready", async () => {
   for (const messageId of Object.keys(giveawayData.giveaways || {})) {
     const gw = giveawayData.giveaways[messageId];
     if (gw && !gw.ended) scheduleGiveawayEnd(messageId);
+  }
+
+  for (const messageId of Object.keys(sosData.games || {})) {
+    const game = sosData.games[messageId];
+    if (!game) continue;
+    if (!game.ended) {
+      scheduleSOSEnd(messageId);
+    } else if (game.drawn && !game.resolved) {
+      // Bot restarted during DM phase — default non-responders to STEAL and resolve
+      defaultNonResponders(game);
+      resolveSOSGame(messageId).catch(() => {});
+    }
   }
 });
 
@@ -1569,6 +1856,37 @@ client.on("interactionCreate", async (interaction) => {
       } catch {}
 
       return interaction.reply({ content: idx === -1 ? "✅ Entered the giveaway!" : "✅ Removed your entry.", ephemeral: true });
+    }
+
+    /* ---------- SOS join ---------- */
+    if (interaction.isButton() && interaction.customId.startsWith("sos_join:")) {
+      const messageId = interaction.customId.split("sos_join:")[1];
+      const game = sosData.games[messageId];
+      if (!game) return interaction.reply({ content: "This game no longer exists.", ephemeral: true });
+      if (game.ended) return interaction.reply({ content: "This game has already ended.", ephemeral: true });
+
+      const need = game.minInvites || 0;
+      if (need > 0) {
+        const have = invitesStillInServerForGuild(interaction.guild.id, interaction.user.id);
+        if (have < need) {
+          return interaction.reply({ content: `❌ Need **${need}** invites. You have **${have}**.`, ephemeral: true });
+        }
+      }
+
+      const userId = interaction.user.id;
+      const idx = game.entries.indexOf(userId);
+      if (idx === -1) game.entries.push(userId);
+      else game.entries.splice(idx, 1);
+
+      saveSOS();
+
+      try {
+        const channel = await client.channels.fetch(game.channelId);
+        const msg = await channel.messages.fetch(game.messageId);
+        await msg.edit({ embeds: [makeSosEmbed(game)], components: [sosRow(game)] });
+      } catch {}
+
+      return interaction.reply({ content: idx === -1 ? "✅ Entered the game!" : "✅ Removed your entry.", ephemeral: true });
     }
 
     /* ---------- Rewards claim button -> modal ---------- */
@@ -2572,6 +2890,57 @@ client.on("interactionCreate", async (interaction) => {
       const res = await rerollGiveaway(messageId, interaction.user.id);
       return interaction.editReply(res.ok ? "✅ Rerolled winners." : `❌ ${res.msg}`);
     }
+
+    /* ---------- /sos ---------- */
+    if (name === "sos") {
+      const member = await interaction.guild.members.fetch(interaction.user.id).catch(() => null);
+      if (!member || (!isOwner(interaction.user.id) && !isStaff(member))) {
+        return interaction.reply({ content: "Staff only (configure staff roles in /settings).", ephemeral: true });
+      }
+
+      const title = interaction.options.getString("title", true).trim();
+      const prize = interaction.options.getString("prize", true).trim();
+      const durationStr = interaction.options.getString("duration", true);
+      const minInvites = interaction.options.getInteger("min_invites", false) ?? 0;
+
+      const ms = parseDurationToMs(durationStr);
+      if (!ms) return interaction.reply({ content: "Invalid duration. Use 30m, 1h, 2d, etc.", ephemeral: true });
+      if (!title) return interaction.reply({ content: "Title cannot be empty.", ephemeral: true });
+      if (!prize) return interaction.reply({ content: "Prize cannot be empty.", ephemeral: true });
+
+      const game = {
+        guildId: interaction.guild.id,
+        channelId: interaction.channel.id,
+        messageId: null,
+        title,
+        prize,
+        hostId: interaction.user.id,
+        endsAt: Date.now() + ms,
+        entries: [],
+        ended: false,
+        minInvites,
+        players: null,
+        responses: {},
+        responsesCount: 0,
+        drawn: false,
+        resolved: false,
+        discussionChannelId: null,
+      };
+
+      const sent = await interaction.reply({
+        embeds: [makeSosEmbed({ ...game, messageId: "pending" })],
+        components: [sosRow({ ...game, messageId: "pending" })],
+        fetchReply: true,
+      });
+
+      game.messageId = sent.id;
+      sosData.games[game.messageId] = game;
+      saveSOS();
+
+      await sent.edit({ embeds: [makeSosEmbed(game)], components: [sosRow(game)] }).catch(() => {});
+      scheduleSOSEnd(game.messageId);
+      return;
+    }
   } catch (e) {
     console.error("interaction error:", e);
     try {
@@ -2585,6 +2954,38 @@ client.on("interactionCreate", async (interaction) => {
 /* ===================== MESSAGE HANDLER (AUTOMOD + PREFIX CMDS + STICKY + CALC) ===================== */
 client.on("messageCreate", async (message) => {
   try {
+    // Handle SOS DM responses
+    if (!message.guild && !message.author.bot && pendingSOSDMs.has(message.author.id)) {
+      const sosMessageId = pendingSOSDMs.get(message.author.id);
+      const game = sosData.games[sosMessageId];
+      if (game && !game.resolved && Array.isArray(game.players) && game.players.includes(message.author.id) && !game.responses[message.author.id]) {
+        const answer = message.content.trim().toUpperCase();
+        if (answer === "SPLIT" || answer === "STEAL") {
+          game.responses[message.author.id] = answer;
+          game.responsesCount++;
+          pendingSOSDMs.delete(message.author.id);
+          saveSOS();
+
+          await message.reply(`✅ Got it! You chose **${answer}**. Waiting for the other player...`).catch(() => {});
+
+          // Update main channel embed with new response count
+          try {
+            const ch = await client.channels.fetch(game.channelId);
+            const msg = await ch.messages.fetch(game.messageId);
+            await msg.edit({ embeds: [makeSosWaitingEmbed(game)], components: [sosRow(game)] });
+          } catch {}
+
+          // If both responded, resolve immediately
+          if (game.responsesCount >= 2) {
+            await resolveSOSGame(sosMessageId);
+          }
+        } else {
+          await message.reply(`❌ Please reply with exactly \`SPLIT\` or \`STEAL\`.`).catch(() => {});
+        }
+      }
+      return;
+    }
+
     if (!message.guild || message.author.bot) return;
 
     if (!isOwner(message.author.id) && isStopped(message.guild.id)) {
