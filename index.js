@@ -811,6 +811,8 @@ function scheduleGiveawayEnd(messageId) {
 
 // In-memory map: userId -> sosMessageId (tracks who needs to respond via DM)
 const pendingSOSDMs = new Map();
+// In-memory map: userId -> promptMessageId (the DM message they must reply to)
+const pendingSOSDMPrompts = new Map();
 
 function makeSosEmbed(game) {
   const endUnix = Math.floor(game.endsAt / 1000);
@@ -936,9 +938,74 @@ async function endSOS(messageId) {
   game.responsesCount = 0;
   game.drawn = true;
   game.resolved = false;
+  game.failedPlayers = [];
   saveSOS();
 
-  const [p1, p2] = players;
+  await runSOSDraw(messageId);
+}
+
+async function redrawSOSPlayers(messageId) {
+  const game = sosData.games[messageId];
+  if (!game || game.resolved) return;
+
+  // Identify who did NOT respond
+  const nonResponders = (game.players || []).filter((uid) => !game.responses[uid]);
+
+  // Clean up pending DM tracking for non-responders
+  for (const uid of nonResponders) {
+    pendingSOSDMs.delete(uid);
+    pendingSOSDMPrompts.delete(uid);
+    game.failedPlayers = game.failedPlayers || [];
+    if (!game.failedPlayers.includes(uid)) game.failedPlayers.push(uid);
+  }
+
+  // Delete old discussion channel if present
+  if (game.discussionChannelId) {
+    const dc = await client.channels.fetch(game.discussionChannelId).catch(() => null);
+    if (dc) await dc.delete().catch(() => {});
+    game.discussionChannelId = null;
+  }
+
+  // Build pool of remaining eligible entries (exclude all previously failed players)
+  const excluded = new Set(game.failedPlayers || []);
+  const pool = (game.entries || []).filter((uid) => !excluded.has(uid));
+
+  const channel = await client.channels.fetch(game.channelId).catch(() => null);
+
+  if (pool.length < 2) {
+    // Not enough players left
+    game.resolved = true;
+    saveSOS();
+    if (channel) {
+      await channel.send(`🎲 **Split or Steal — ${game.title}:** Not enough players responded. Game cancelled.`).catch(() => {});
+      const msg2 = await channel.messages.fetch(game.messageId).catch(() => null);
+      if (msg2) await msg2.edit({ embeds: [makeSosEmbed(game)], components: [sosRow(game)] }).catch(() => {});
+    }
+    return;
+  }
+
+  // Pick 2 new random players
+  const newPlayers = pickRandomWinners(pool, 2);
+  game.players = newPlayers;
+  game.responses = {};
+  game.responsesCount = 0;
+  saveSOS();
+
+  if (channel) {
+    await channel.send(`🔄 Previous players did not respond in time. Drawing 2 new players...`).catch(() => {});
+  }
+
+  // Re-run the draw/DM flow with the new players
+  await runSOSDraw(messageId);
+}
+
+async function runSOSDraw(messageId) {
+  const game = sosData.games[messageId];
+  if (!game || game.resolved) return;
+
+  const [p1, p2] = game.players;
+  const channel = await client.channels.fetch(game.channelId).catch(() => null);
+  const msg = channel ? await channel.messages.fetch(game.messageId).catch(() => null) : null;
 
   const s = getGuildSettings(game.guildId);
   const guild = client.guilds.cache.get(game.guildId) || (await client.guilds.fetch(game.guildId).catch(() => null));
@@ -982,7 +1049,7 @@ async function endSOS(messageId) {
             .setDescription(
               `<@${p1}> and <@${p2}> — you two have been selected!\n\n` +
                 `**Prize:** ${game.prize}\n\n` +
-                `Check your DMs! You have **2 minutes** to reply with \`SPLIT\` or \`STEAL\`.\n\n` +
+                `Check your DMs! You have **2 hours** to reply with \`SPLIT\` or \`STEAL\`.\n\n` +
                 `Use this channel to discuss your strategy before deciding.`
             ),
         ],
@@ -992,44 +1059,46 @@ async function endSOS(messageId) {
 
   if (msg) await msg.edit({ embeds: [makeSosWaitingEmbed(game)], components: [sosRow(game)] }).catch(() => {});
 
-  // DM both players and track pending responses in one pass
-  for (const userId of players) {
+  // DM both players
+  for (const userId of [p1, p2]) {
     try {
       const user = await client.users.fetch(userId);
-      await user.send(
+      const promptMessage = await user.send(
         `🎲 **You've been selected for Split or Steal!**\n\n` +
           `**Game:** ${game.title}\n` +
           `**Prize:** ${game.prize}\n\n` +
-          `Do you want to **SPLIT** or **STEAL**?\n` +
-          `Reply with \`SPLIT\` or \`STEAL\` within **2 minutes**.\n\n` +
-          `⚠️ If you don't respond in time, you'll default to **STEAL**.`
+          `Do you want to **SPLIT** or **STEAL**?\n\n` +
+          `⚠️ You MUST reply to THIS message (right-click → Reply, or swipe) — do NOT just type in the chat. ` +
+          `Type \`SPLIT\` or \`STEAL\` as a reply to this message.\n\n` +
+          `You have **2 hours** to respond.`
       );
-      // DM succeeded — register for DM collection
       pendingSOSDMs.set(userId, messageId);
+      pendingSOSDMPrompts.set(userId, promptMessage.id);
     } catch {
-      // DMs closed — default to STEAL immediately
-      game.responses[userId] = "STEAL";
-      game.responsesCount++;
+      game.failedPlayers = game.failedPlayers || [];
+      if (!game.failedPlayers.includes(userId)) game.failedPlayers.push(userId);
     }
   }
   saveSOS();
 
-  // If both already defaulted (DMs closed), resolve immediately
-  if (game.responsesCount >= 2) {
-    await resolveSOSGame(messageId);
+  // If both players had DMs closed, do another redraw
+  const playersWithoutPendingDMs = [p1, p2].filter((uid) => !pendingSOSDMs.has(uid));
+  if (playersWithoutPendingDMs.length === 2) {
+    await redrawSOSPlayers(messageId);
     return;
   }
 
-  // Update waiting embed to reflect any instant defaults
   if (msg) await msg.edit({ embeds: [makeSosWaitingEmbed(game)], components: [sosRow(game)] }).catch(() => {});
 
-  // 2-minute timeout — non-responders default to STEAL
+  // 2-hour timeout — non-responders trigger another redraw
   setTimeout(async () => {
     const g = sosData.games[messageId];
     if (!g || g.resolved) return;
-    defaultNonResponders(g);
-    await resolveSOSGame(messageId);
-  }, 2 * 60 * 1000);
+    // Only redraw if these specific players still haven't responded
+    const stillPending = [p1, p2].filter((uid) => !g.responses[uid]);
+    if (stillPending.length === 0) return;
+    await redrawSOSPlayers(messageId);
+  }, 2 * 60 * 60 * 1000);
 }
 
 function defaultNonResponders(game) {
@@ -1039,6 +1108,7 @@ function defaultNonResponders(game) {
       game.responses[userId] = "STEAL";
       game.responsesCount++;
       pendingSOSDMs.delete(userId);
+      pendingSOSDMPrompts.delete(userId);
       changed = true;
     }
   }
@@ -1617,9 +1687,8 @@ client.once("ready", async () => {
     if (!game.ended) {
       scheduleSOSEnd(messageId);
     } else if (game.drawn && !game.resolved) {
-      // Bot restarted during DM phase — default non-responders to STEAL and resolve
-      defaultNonResponders(game);
-      resolveSOSGame(messageId).catch(() => {});
+      // Bot restarted during DM phase — redraw since we can't restore the DM timers
+      redrawSOSPlayers(messageId).catch(() => {});
     }
   }
 });
@@ -1743,23 +1812,15 @@ client.on("guildMemberRemove", async (member) => {
 });
 
 /* ===================== TICKET EMBED (COOL) + CLOSE BUTTON ===================== */
-function buildTicketInsideEmbed({ typeLabel, user, mc, need, createdAtMs }) {
-  const openedUnix = Math.floor((createdAtMs || Date.now()) / 1000);
+function buildTicketInsideEmbed({ typeLabel, user, mc, need }) {
   return new EmbedBuilder()
-    .setTitle(`🎫 ${typeLabel} Ticket`)
+    .setTitle(`${typeLabel} Ticket`)
     .setColor(0x2b2d31)
-    .setDescription(
-      `**Welcome, ${user}!**\n` +
-        `A staff member will be with you soon.\n\n` +
-        `🕒 **Opened:** <t:${openedUnix}:F> (<t:${openedUnix}:R>)`
-    )
+    .setDescription(`${user} — a staff member will be with you shortly.`)
     .addFields(
-      { name: "👤 User", value: `${user} (${user.tag})`, inline: true },
-      { name: "🟩 Minecraft", value: (mc || "N/A").slice(0, 64), inline: true },
-      { name: "📝 Request", value: (need || "N/A").slice(0, 1024), inline: false },
-      { name: "✅ Tip", value: "Send any proof/screenshots here to speed things up.", inline: false }
+      { name: "Minecraft", value: (mc || "N/A").slice(0, 64), inline: true },
+      { name: "Request", value: (need || "N/A").slice(0, 1024), inline: false }
     )
-    .setFooter({ text: "DonutDemand Support • Use the button below to close when done" })
     .setTimestamp();
 }
 
@@ -2174,7 +2235,6 @@ client.on("interactionCreate", async (interaction) => {
         user: interaction.user,
         mc,
         need,
-        createdAtMs: createdAt,
       });
 
       await channel.send({
@@ -2959,11 +3019,18 @@ client.on("messageCreate", async (message) => {
       const sosMessageId = pendingSOSDMs.get(message.author.id);
       const game = sosData.games[sosMessageId];
       if (game && !game.resolved && Array.isArray(game.players) && game.players.includes(message.author.id) && !game.responses[message.author.id]) {
+        // Only accept messages that are actual replies to the bot's prompt
+        const expectedPromptId = pendingSOSDMPrompts.get(message.author.id);
+        if (expectedPromptId && (!message.reference?.messageId || message.reference.messageId !== expectedPromptId)) {
+          await message.reply(`⚠️ Please **reply** to the bot's original message (right-click → Reply, or swipe). Do NOT just type in the chat.`).catch(() => {});
+          return;
+        }
         const answer = message.content.trim().toUpperCase();
         if (answer === "SPLIT" || answer === "STEAL") {
           game.responses[message.author.id] = answer;
           game.responsesCount++;
           pendingSOSDMs.delete(message.author.id);
+          pendingSOSDMPrompts.delete(message.author.id);
           saveSOS();
 
           await message.reply(`✅ Got it! You chose **${answer}**. Waiting for the other player...`).catch(() => {});
