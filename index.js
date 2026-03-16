@@ -48,6 +48,10 @@ const {
   ModalBuilder,
   TextInputBuilder,
   TextInputStyle,
+  StringSelectMenuBuilder,
+  StringSelectMenuOptionBuilder,
+  RoleSelectMenuBuilder,
+  ChannelSelectMenuBuilder,
   REST,
   Routes,
   SlashCommandBuilder,
@@ -169,6 +173,9 @@ function defaultGuildSettings() {
       enabled: true,
       bypassRoleName: "automod",
     },
+
+    // per-ticket-type role visibility overrides
+    ticketRoleOverrides: {},
   };
 }
 
@@ -188,6 +195,7 @@ function getGuildSettings(guildId) {
   s.automod ??= { enabled: true, bypassRoleName: "automod" };
   s.automod.enabled ??= true;
   s.automod.bypassRoleName ??= "automod";
+  s.ticketRoleOverrides ??= {};
   return s;
 }
 
@@ -345,6 +353,81 @@ function isValidWebhookUrl(url) {
   const s = String(url).trim();
   if (!/^https:\/\/(canary\.|ptb\.)?discord\.com\/api\/webhooks\/\d+\/[\w-]+/i.test(s)) return false;
   return true;
+}
+
+/* ===================== SETTINGS DASHBOARD HELPERS ===================== */
+function buildSettingsEmbed(guild, s) {
+  const staffMentions = (s.staffRoleIds || []).map((id) => `<@&${id}>`).join(", ") || "None set";
+  const vouchesChannel = s.vouchesChannelId ? `<#${s.vouchesChannelId}>` : "Not set";
+  const joinLogChannel = s.joinLogChannelId ? `<#${s.joinLogChannelId}>` : "Not set";
+  const notifChannel = s.notificationChannelId ? `<#${s.notificationChannelId}>` : "Not set";
+  const customerRole = s.customerRoleId ? `<@&${s.customerRoleId}>` : "Not set";
+  const rewardsWebhook = s.rewardsWebhookUrl ? "✅ Configured" : "❌ Not set";
+  const automodStatus = s.automod?.enabled
+    ? `✅ Enabled (bypass: ${s.automod.bypassRoleName || "automod"})`
+    : "❌ Disabled";
+
+  const overrides = s.ticketRoleOverrides || {};
+  const overrideLines = Object.entries(overrides)
+    .filter(([, roles]) => Array.isArray(roles) && roles.length > 0)
+    .map(([typeId, roles]) => `\`${typeId}\`: ${roles.map((id) => `<@&${id}>`).join(", ")}`)
+    .join("\n");
+
+  const embed = new EmbedBuilder()
+    .setTitle("⚙️ Bot Settings Dashboard")
+    .setColor(0x1e1f22)
+    .addFields(
+      { name: "👥 Staff Roles", value: staffMentions, inline: true },
+      { name: "📝 Vouches Channel", value: vouchesChannel, inline: true },
+      { name: "📋 Join Log Channel", value: joinLogChannel, inline: true },
+      { name: "🔔 Notification Channel", value: notifChannel, inline: true },
+      { name: "🎫 Customer Role", value: customerRole, inline: true },
+      { name: "🔗 Rewards Webhook", value: rewardsWebhook, inline: true },
+      { name: "🛡️ Automod", value: automodStatus, inline: false },
+      { name: "🎟️ Ticket Role Overrides", value: overrideLines || "None configured", inline: false }
+    );
+
+  return embed;
+}
+
+function buildSettingsComponents(guildId) {
+  const config = getPanelConfig(guildId);
+  const ticketTypes = config.tickets || [];
+
+  const mainSelect = new StringSelectMenuBuilder()
+    .setCustomId("settings_main_select")
+    .setPlaceholder("⚙️ Choose a setting to configure")
+    .addOptions(
+      new StringSelectMenuOptionBuilder().setLabel("Manage Staff Roles").setDescription("Add or remove staff roles").setValue("set_staff_roles").setEmoji("👥"),
+      new StringSelectMenuOptionBuilder().setLabel("Set Vouches Channel").setDescription("Channel where vouches are counted").setValue("set_vouches_channel").setEmoji("📝"),
+      new StringSelectMenuOptionBuilder().setLabel("Set Join Log Channel").setDescription("Channel for join/leave logs").setValue("set_joinlog_channel").setEmoji("📋"),
+      new StringSelectMenuOptionBuilder().setLabel("Set Notification Channel").setDescription("Channel for invite backup notifications").setValue("set_notification_channel").setEmoji("🔔"),
+      new StringSelectMenuOptionBuilder().setLabel("Set Customer Role").setDescription("Role given to customers via /operation").setValue("set_customer_role").setEmoji("🎫"),
+      new StringSelectMenuOptionBuilder().setLabel("Set Rewards Webhook").setDescription("Discord webhook URL for rewards").setValue("set_rewards_webhook").setEmoji("🔗"),
+      new StringSelectMenuOptionBuilder().setLabel("Toggle Automod").setDescription("Enable or disable the link blocker").setValue("toggle_automod").setEmoji("🛡️"),
+      new StringSelectMenuOptionBuilder().setLabel("Reset All Settings").setDescription("Reset all settings to defaults").setValue("reset_settings").setEmoji("🔄")
+    );
+
+  const emojiMap = { ticket_support: "🆘", ticket_claim: "💰", ticket_sell: "💸", ticket_rewards: "🎁" };
+  const ticketOptions = ticketTypes.map((t) =>
+    new StringSelectMenuOptionBuilder()
+      .setLabel(`${t.label} — Set Roles`)
+      .setDescription(`Configure which roles can view ${t.label} tickets`)
+      .setValue(t.id)
+      .setEmoji(emojiMap[t.id] || "🎫")
+  );
+
+  const rows = [new ActionRowBuilder().addComponents(mainSelect)];
+
+  if (ticketOptions.length > 0) {
+    const ticketSelect = new StringSelectMenuBuilder()
+      .setCustomId("settings_ticket_type_select")
+      .setPlaceholder("🎫 Configure which roles can view each ticket type")
+      .addOptions(ticketOptions);
+    rows.push(new ActionRowBuilder().addComponents(ticketSelect));
+  }
+
+  return rows;
 }
 
 async function sendWebhook(webhookUrl, payload) {
@@ -1042,6 +1125,12 @@ async function runSOSDraw(messageId) {
 
   let discussionChannel = null;
   if (guild) {
+    // Use per-ticket-type roles for SOS if configured, otherwise fall back to staff roles
+    const sosOverrideRoles =
+      s.ticketRoleOverrides && s.ticketRoleOverrides["sos_discussion"] && s.ticketRoleOverrides["sos_discussion"].length > 0
+        ? s.ticketRoleOverrides["sos_discussion"]
+        : s.staffRoleIds || [];
+
     const overwrites = [
       { id: guild.roles.everyone.id, deny: [PermissionsBitField.Flags.ViewChannel] },
       {
@@ -1052,7 +1141,7 @@ async function runSOSDraw(messageId) {
         id: p2,
         allow: [PermissionsBitField.Flags.ViewChannel, PermissionsBitField.Flags.SendMessages, PermissionsBitField.Flags.ReadMessageHistory],
       },
-      ...(s.staffRoleIds || []).map((rid) => ({
+      ...sosOverrideRoles.map((rid) => ({
         id: rid,
         allow: [PermissionsBitField.Flags.ViewChannel, PermissionsBitField.Flags.SendMessages, PermissionsBitField.Flags.ReadMessageHistory],
       })),
@@ -1379,69 +1468,8 @@ function buildBidRow(messageId, ended) {
 function buildCommandsJSON() {
   const settingsCmd = new SlashCommandBuilder()
     .setName("settings")
-    .setDescription("Admin: configure this bot for your server.")
-    .setDMPermission(false)
-    .addSubcommand((s) => s.setName("show").setDescription("Show current settings (ephemeral)."))
-    .addSubcommand((s) => s.setName("reset").setDescription("Reset settings to defaults."))
-    .addSubcommand((s) =>
-      s
-        .setName("set_staff_role")
-        .setDescription("Add or remove a staff role.")
-        .addStringOption((o) =>
-          o
-            .setName("action")
-            .setDescription("add/remove/clear")
-            .setRequired(true)
-            .addChoices(
-              { name: "add", value: "add" },
-              { name: "remove", value: "remove" },
-              { name: "clear", value: "clear" }
-            )
-        )
-        .addRoleOption((o) => o.setName("role").setDescription("Role to add/remove (not needed for clear).").setRequired(false))
-    )
-    .addSubcommand((s) =>
-      s
-        .setName("set_channel")
-        .setDescription("Set bot channels.")
-        .addStringOption((o) =>
-          o
-            .setName("type")
-            .setDescription("Which channel setting?")
-            .setRequired(true)
-            .addChoices({ name: "vouches", value: "vouches" }, { name: "join_log", value: "join_log" })
-        )
-        .addChannelOption((o) =>
-          o.setName("channel").setDescription("Text channel").addChannelTypes(ChannelType.GuildText).setRequired(true)
-        )
-    )
-    .addSubcommand((s) =>
-      s
-        .setName("set_customer_role")
-        .setDescription("Set the customer role used by /operation.")
-        .addRoleOption((o) => o.setName("role").setDescription("Customer role").setRequired(true))
-    )
-    .addSubcommand((s) =>
-      s
-        .setName("set_rewards_webhook")
-        .setDescription("Set the rewards claim webhook URL (used by Claim Rewards panel).")
-        .addStringOption((o) => o.setName("url").setDescription("Discord webhook URL").setRequired(true))
-    )
-    .addSubcommand((s) =>
-      s
-        .setName("automod")
-        .setDescription("Configure link blocker.")
-        .addStringOption((o) =>
-          o
-            .setName("enabled")
-            .setDescription("Enable or disable automod")
-            .setRequired(true)
-            .addChoices({ name: "on", value: "on" }, { name: "off", value: "off" })
-        )
-        .addStringOption((o) =>
-          o.setName("bypass_role_name").setDescription("Role NAME that bypasses link block (default: automod)").setRequired(false)
-        )
-    );
+    .setDescription("Admin: open the bot settings dashboard.")
+    .setDMPermission(false);
 
   const panelCmd = new SlashCommandBuilder()
     .setName("panel")
@@ -1670,14 +1698,6 @@ function buildCommandsJSON() {
     .setDMPermission(false)
     .addUserOption((o) => o.setName("user").setDescription("User to add to this ticket").setRequired(true));
 
-  const notificationCmd = new SlashCommandBuilder()
-    .setName("notification")
-    .setDescription("Admin: set the channel where invite auto-backup notifications are sent.")
-    .setDMPermission(false)
-    .addChannelOption((o) =>
-      o.setName("channel").setDescription("Channel to send backup notifications in").addChannelTypes(ChannelType.GuildText).setRequired(true)
-    );
-
   return [
     settingsCmd,
     panelCmd,
@@ -1698,7 +1718,6 @@ function buildCommandsJSON() {
     redeemCmd,
     bidCmd,
     addCmd,
-    notificationCmd,
   ].map((c) => c.toJSON());
 }
 
@@ -2174,13 +2193,19 @@ client.on("interactionCreate", async (interaction) => {
       const channelName = `bid-${cleanName(winnerMember?.user.username || winnerId)}`;
       const createdAt = Date.now();
 
+      // Use per-ticket-type roles if configured, otherwise fall back to staff roles
+      const auctionOverrideRoles =
+        s.ticketRoleOverrides && s.ticketRoleOverrides["bid_winner"] && s.ticketRoleOverrides["bid_winner"].length > 0
+          ? s.ticketRoleOverrides["bid_winner"]
+          : s.staffRoleIds || [];
+
       const overwrites = [
         { id: guild.roles.everyone.id, deny: [PermissionsBitField.Flags.ViewChannel] },
         {
           id: winnerId,
           allow: [PermissionsBitField.Flags.ViewChannel, PermissionsBitField.Flags.SendMessages, PermissionsBitField.Flags.ReadMessageHistory],
         },
-        ...(s.staffRoleIds || []).map((rid) => ({
+        ...auctionOverrideRoles.map((rid) => ({
           id: rid,
           allow: [PermissionsBitField.Flags.ViewChannel, PermissionsBitField.Flags.SendMessages, PermissionsBitField.Flags.ReadMessageHistory],
         })),
@@ -2211,7 +2236,7 @@ client.on("interactionCreate", async (interaction) => {
       const s = getGuildSettings(interaction.guild.id);
       if (!s.rewardsWebhookUrl) {
         return interaction.reply({
-          content: "❌ Rewards webhook is not configured. Ask an admin to set it with /settings set_rewards_webhook.",
+          content: "❌ Rewards webhook is not configured. Ask an admin to set it via /settings → Set Rewards Webhook.",
           ephemeral: true,
         });
       }
@@ -2267,7 +2292,7 @@ client.on("interactionCreate", async (interaction) => {
       const webhookUrl = s.rewardsWebhookUrl;
 
       if (!webhookUrl) {
-        return interaction.editReply("❌ Rewards webhook is not configured. Ask an admin to set it with /settings set_rewards_webhook.");
+        return interaction.editReply("❌ Rewards webhook is not configured. Ask an admin to set it via /settings → Set Rewards Webhook.");
       }
 
       const gate = canClaimRewardsNow(interaction.guild.id, interaction.user.id);
@@ -2437,6 +2462,198 @@ client.on("interactionCreate", async (interaction) => {
       return interaction.reply({ content: "✅ Posted Claim Rewards panel.", ephemeral: true });
     }
 
+    /* ---------- Settings select menu handlers ---------- */
+    /* ---------- settings_main_select ---------- */
+    if (interaction.isStringSelectMenu() && interaction.customId === "settings_main_select") {
+      const member = await interaction.guild.members.fetch(interaction.user.id).catch(() => null);
+      if (!member || !isAdminOrOwner(member)) return interaction.reply({ content: "Admins only.", ephemeral: true });
+
+      const value = interaction.values[0];
+      const s = getGuildSettings(interaction.guild.id);
+
+      if (value === "set_staff_roles") {
+        const picker = new RoleSelectMenuBuilder()
+          .setCustomId("settings_staff_role_picker")
+          .setPlaceholder("Select staff roles (select none to clear)")
+          .setMinValues(0)
+          .setMaxValues(10);
+        return interaction.reply({ content: "👥 Select the staff roles:", components: [new ActionRowBuilder().addComponents(picker)], ephemeral: true });
+      }
+
+      if (value === "set_vouches_channel") {
+        const picker = new ChannelSelectMenuBuilder()
+          .setCustomId("settings_vouches_ch_picker")
+          .setPlaceholder("Select vouches channel")
+          .addChannelTypes(ChannelType.GuildText);
+        return interaction.reply({ content: "📝 Select the vouches channel:", components: [new ActionRowBuilder().addComponents(picker)], ephemeral: true });
+      }
+
+      if (value === "set_joinlog_channel") {
+        const picker = new ChannelSelectMenuBuilder()
+          .setCustomId("settings_joinlog_ch_picker")
+          .setPlaceholder("Select join log channel")
+          .addChannelTypes(ChannelType.GuildText);
+        return interaction.reply({ content: "📋 Select the join log channel:", components: [new ActionRowBuilder().addComponents(picker)], ephemeral: true });
+      }
+
+      if (value === "set_notification_channel") {
+        const picker = new ChannelSelectMenuBuilder()
+          .setCustomId("settings_notification_ch_picker")
+          .setPlaceholder("Select notification channel")
+          .addChannelTypes(ChannelType.GuildText);
+        return interaction.reply({ content: "🔔 Select the notification channel:", components: [new ActionRowBuilder().addComponents(picker)], ephemeral: true });
+      }
+
+      if (value === "set_customer_role") {
+        const picker = new RoleSelectMenuBuilder()
+          .setCustomId("settings_customer_role_picker")
+          .setPlaceholder("Select customer role")
+          .setMinValues(0)
+          .setMaxValues(1);
+        return interaction.reply({ content: "🎫 Select the customer role:", components: [new ActionRowBuilder().addComponents(picker)], ephemeral: true });
+      }
+
+      if (value === "set_rewards_webhook") {
+        await interaction.reply({ content: "🔗 Please type the Discord webhook URL in this channel. You have 30 seconds.", ephemeral: true });
+        const filter = (m) => m.author.id === interaction.user.id;
+        const collector = interaction.channel.createMessageCollector({ filter, max: 1, time: 30000 });
+        collector.on("collect", async (msg) => {
+          const url = msg.content.trim();
+          msg.delete().catch(() => {});
+          if (!isValidWebhookUrl(url)) {
+            return interaction.followUp({ content: "❌ Invalid webhook URL. Must start with `https://discord.com/api/webhooks/...`", ephemeral: true });
+          }
+          s.rewardsWebhookUrl = url;
+          saveSettings();
+          const updatedEmbed = buildSettingsEmbed(interaction.guild, getGuildSettings(interaction.guild.id));
+          const updatedComponents = buildSettingsComponents(interaction.guild.id);
+          await interaction.editReply({ content: null, embeds: [updatedEmbed], components: updatedComponents });
+          await interaction.followUp({ content: "✅ Rewards webhook saved.", ephemeral: true });
+        });
+        collector.on("end", (collected) => {
+          if (collected.size === 0) interaction.followUp({ content: "⏱️ No URL received — timed out.", ephemeral: true }).catch(() => {});
+        });
+        return;
+      }
+
+      if (value === "toggle_automod") {
+        s.automod ??= { enabled: true, bypassRoleName: "automod" };
+        s.automod.enabled = !s.automod.enabled;
+        saveSettings();
+        const updatedEmbed = buildSettingsEmbed(interaction.guild, getGuildSettings(interaction.guild.id));
+        const updatedComponents = buildSettingsComponents(interaction.guild.id);
+        return interaction.update({ embeds: [updatedEmbed], components: updatedComponents });
+      }
+
+      if (value === "reset_settings") {
+        settingsStore.byGuild[interaction.guild.id] = defaultGuildSettings();
+        saveSettings();
+        const updatedEmbed = buildSettingsEmbed(interaction.guild, getGuildSettings(interaction.guild.id));
+        const updatedComponents = buildSettingsComponents(interaction.guild.id);
+        return interaction.update({ embeds: [updatedEmbed], components: updatedComponents });
+      }
+
+      return interaction.reply({ content: "Unknown option.", ephemeral: true });
+    }
+
+    /* ---------- settings_staff_role_picker ---------- */
+    if (interaction.isRoleSelectMenu() && interaction.customId === "settings_staff_role_picker") {
+      const member = await interaction.guild.members.fetch(interaction.user.id).catch(() => null);
+      if (!member || !isAdminOrOwner(member)) return interaction.reply({ content: "Admins only.", ephemeral: true });
+
+      const s = getGuildSettings(interaction.guild.id);
+      s.staffRoleIds = interaction.values;
+      saveSettings();
+      return interaction.reply({ content: `✅ Staff roles updated: ${s.staffRoleIds.length > 0 ? s.staffRoleIds.map((id) => `<@&${id}>`).join(", ") : "none"}`, ephemeral: true });
+    }
+
+    /* ---------- settings_customer_role_picker ---------- */
+    if (interaction.isRoleSelectMenu() && interaction.customId === "settings_customer_role_picker") {
+      const member = await interaction.guild.members.fetch(interaction.user.id).catch(() => null);
+      if (!member || !isAdminOrOwner(member)) return interaction.reply({ content: "Admins only.", ephemeral: true });
+
+      const s = getGuildSettings(interaction.guild.id);
+      s.customerRoleId = interaction.values[0] || null;
+      saveSettings();
+      return interaction.reply({ content: `✅ Customer role set to ${s.customerRoleId ? `<@&${s.customerRoleId}>` : "none"}.`, ephemeral: true });
+    }
+
+    /* ---------- settings channel pickers ---------- */
+    if (interaction.isChannelSelectMenu() && interaction.customId === "settings_vouches_ch_picker") {
+      const member = await interaction.guild.members.fetch(interaction.user.id).catch(() => null);
+      if (!member || !isAdminOrOwner(member)) return interaction.reply({ content: "Admins only.", ephemeral: true });
+
+      const s = getGuildSettings(interaction.guild.id);
+      s.vouchesChannelId = interaction.values[0] || null;
+      saveSettings();
+      return interaction.reply({ content: `✅ Vouches channel set to <#${s.vouchesChannelId}>.`, ephemeral: true });
+    }
+
+    if (interaction.isChannelSelectMenu() && interaction.customId === "settings_joinlog_ch_picker") {
+      const member = await interaction.guild.members.fetch(interaction.user.id).catch(() => null);
+      if (!member || !isAdminOrOwner(member)) return interaction.reply({ content: "Admins only.", ephemeral: true });
+
+      const s = getGuildSettings(interaction.guild.id);
+      s.joinLogChannelId = interaction.values[0] || null;
+      saveSettings();
+      return interaction.reply({ content: `✅ Join log channel set to <#${s.joinLogChannelId}>.`, ephemeral: true });
+    }
+
+    if (interaction.isChannelSelectMenu() && interaction.customId === "settings_notification_ch_picker") {
+      const member = await interaction.guild.members.fetch(interaction.user.id).catch(() => null);
+      if (!member || !isAdminOrOwner(member)) return interaction.reply({ content: "Admins only.", ephemeral: true });
+
+      const s = getGuildSettings(interaction.guild.id);
+      s.notificationChannelId = interaction.values[0] || null;
+      saveSettings();
+      return interaction.reply({ content: `✅ Notification channel set to <#${s.notificationChannelId}>.`, ephemeral: true });
+    }
+
+    /* ---------- settings_ticket_type_select ---------- */
+    if (interaction.isStringSelectMenu() && interaction.customId === "settings_ticket_type_select") {
+      const member = await interaction.guild.members.fetch(interaction.user.id).catch(() => null);
+      if (!member || !isAdminOrOwner(member)) return interaction.reply({ content: "Admins only.", ephemeral: true });
+
+      const typeId = interaction.values[0];
+      const config = getPanelConfig(interaction.guild.id);
+      const ticketType = (config.tickets || []).find((t) => t.id === typeId);
+      const typeName = ticketType ? ticketType.label : typeId;
+
+      const picker = new RoleSelectMenuBuilder()
+        .setCustomId(`settings_ticket_roles_picker:${typeId}`)
+        .setPlaceholder(`Select roles that can view ${typeName} tickets (none = use staff roles)`)
+        .setMinValues(0)
+        .setMaxValues(10);
+      return interaction.reply({
+        content: `🎫 Select which roles can view **${typeName}** tickets. Leave empty to fall back to staff roles.`,
+        components: [new ActionRowBuilder().addComponents(picker)],
+        ephemeral: true,
+      });
+    }
+
+    /* ---------- settings_ticket_roles_picker ---------- */
+    if (interaction.isRoleSelectMenu() && interaction.customId.startsWith("settings_ticket_roles_picker:")) {
+      const member = await interaction.guild.members.fetch(interaction.user.id).catch(() => null);
+      if (!member || !isAdminOrOwner(member)) return interaction.reply({ content: "Admins only.", ephemeral: true });
+
+      const typeId = interaction.customId.split("settings_ticket_roles_picker:")[1];
+      const s = getGuildSettings(interaction.guild.id);
+      s.ticketRoleOverrides ??= {};
+
+      if (interaction.values.length > 0) {
+        s.ticketRoleOverrides[typeId] = interaction.values;
+      } else {
+        delete s.ticketRoleOverrides[typeId];
+      }
+      saveSettings();
+
+      const config = getPanelConfig(interaction.guild.id);
+      const ticketType = (config.tickets || []).find((t) => t.id === typeId);
+      const typeName = ticketType ? ticketType.label : typeId;
+      const roleList = interaction.values.length > 0 ? interaction.values.map((id) => `<@&${id}>`).join(", ") : "none (falls back to staff roles)";
+      return interaction.reply({ content: `✅ **${typeName}** ticket visibility roles set to: ${roleList}`, ephemeral: true });
+    }
+
     /* ---------- Ticket modal submit ---------- */
     if (interaction.isModalSubmit() && interaction.customId.startsWith("ticket_modal:")) {
       await interaction.deferReply({ ephemeral: true });
@@ -2457,6 +2674,12 @@ client.on("interactionCreate", async (interaction) => {
 
       const s = getGuildSettings(interaction.guild.id);
 
+      // Use per-ticket-type roles if configured, otherwise fall back to staff roles
+      const overrideRoles =
+        s.ticketRoleOverrides && s.ticketRoleOverrides[typeId] && s.ticketRoleOverrides[typeId].length > 0
+          ? s.ticketRoleOverrides[typeId]
+          : s.staffRoleIds || [];
+
       const overwrites = [
         { id: interaction.guild.roles.everyone.id, deny: [PermissionsBitField.Flags.ViewChannel] },
         {
@@ -2467,7 +2690,7 @@ client.on("interactionCreate", async (interaction) => {
             PermissionsBitField.Flags.ReadMessageHistory,
           ],
         },
-        ...(s.staffRoleIds || []).map((rid) => ({
+        ...overrideRoles.map((rid) => ({
           id: rid,
           allow: [
             PermissionsBitField.Flags.ViewChannel,
@@ -2657,94 +2880,11 @@ client.on("interactionCreate", async (interaction) => {
       const member = await interaction.guild.members.fetch(interaction.user.id).catch(() => null);
       if (!member || !isAdminOrOwner(member)) return interaction.reply({ content: "Admins only.", ephemeral: true });
 
-      const sub = interaction.options.getSubcommand();
       const s = getGuildSettings(interaction.guild.id);
+      const embed = buildSettingsEmbed(interaction.guild, s);
+      const components = buildSettingsComponents(interaction.guild.id);
 
-      if (sub === "show") {
-        const safe = {
-          staffRoleIds: s.staffRoleIds,
-          vouchesChannelId: s.vouchesChannelId,
-          joinLogChannelId: s.joinLogChannelId,
-          customerRoleId: s.customerRoleId,
-          invitesBlacklist: s.invitesBlacklist,
-          rewardsWebhookUrl: s.rewardsWebhookUrl,
-          automod: s.automod,
-        };
-        const json = JSON.stringify(safe, null, 2);
-        return interaction.reply({ content: "```json\n" + json.slice(0, 1800) + "\n```", ephemeral: true });
-      }
-
-      if (sub === "reset") {
-        settingsStore.byGuild[interaction.guild.id] = defaultGuildSettings();
-        saveSettings();
-        return interaction.reply({ content: "✅ Settings reset to defaults.", ephemeral: true });
-      }
-
-      if (sub === "set_staff_role") {
-        const action = interaction.options.getString("action", true);
-        const role = interaction.options.getRole("role", false);
-
-        if (action === "clear") {
-          s.staffRoleIds = [];
-          saveSettings();
-          return interaction.reply({ content: "✅ Cleared staff roles.", ephemeral: true });
-        }
-        if (!role) return interaction.reply({ content: "Pick a role.", ephemeral: true });
-
-        s.staffRoleIds ??= [];
-
-        if (action === "add") {
-          if (!s.staffRoleIds.includes(role.id)) s.staffRoleIds.push(role.id);
-          saveSettings();
-          return interaction.reply({ content: `✅ Added staff role: ${role}`, ephemeral: true });
-        }
-        if (action === "remove") {
-          s.staffRoleIds = s.staffRoleIds.filter((x) => x !== role.id);
-          saveSettings();
-          return interaction.reply({ content: `✅ Removed staff role: ${role}`, ephemeral: true });
-        }
-      }
-
-      if (sub === "set_channel") {
-        const type = interaction.options.getString("type", true);
-        const channel = interaction.options.getChannel("channel", true);
-        if (type === "vouches") s.vouchesChannelId = channel.id;
-        if (type === "join_log") s.joinLogChannelId = channel.id;
-        saveSettings();
-        return interaction.reply({ content: `✅ Set **${type}** channel to ${channel}.`, ephemeral: true });
-      }
-
-      if (sub === "set_customer_role") {
-        const role = interaction.options.getRole("role", true);
-        s.customerRoleId = role.id;
-        saveSettings();
-        return interaction.reply({ content: `✅ Customer role set to ${role}.`, ephemeral: true });
-      }
-
-      if (sub === "set_rewards_webhook") {
-        const url = interaction.options.getString("url", true).trim();
-        if (!isValidWebhookUrl(url)) {
-          return interaction.reply({
-            content: "❌ That doesn't look like a valid Discord webhook URL. It should start with `https://discord.com/api/webhooks/...`",
-            ephemeral: true,
-          });
-        }
-        s.rewardsWebhookUrl = url;
-        saveSettings();
-        return interaction.reply({ content: "✅ Rewards webhook saved for this server.", ephemeral: true });
-      }
-
-      if (sub === "automod") {
-        const enabled = interaction.options.getString("enabled", true) === "on";
-        const bypassName = interaction.options.getString("bypass_role_name", false);
-        s.automod.enabled = enabled;
-        if (bypassName && bypassName.trim()) s.automod.bypassRoleName = bypassName.trim().slice(0, 50);
-        saveSettings();
-        return interaction.reply({
-          content: `✅ Automod is now **${enabled ? "ON" : "OFF"}**.\nBypass role name: **${s.automod.bypassRoleName}**`,
-          ephemeral: true,
-        });
-      }
+      return interaction.reply({ embeds: [embed], components, ephemeral: true });
     }
 
     /* ---------- /panel ---------- */
@@ -2862,7 +3002,7 @@ client.on("interactionCreate", async (interaction) => {
     if (name === "vouches") {
       const s = getGuildSettings(interaction.guild.id);
       if (!s.vouchesChannelId) {
-        return interaction.reply({ content: "Set vouches channel first: /settings set_channel type:vouches channel:#...", ephemeral: true });
+        return interaction.reply({ content: "Set vouches channel first via /settings → Set Vouches Channel.", ephemeral: true });
       }
 
       await interaction.deferReply({ ephemeral: false });
@@ -3093,7 +3233,7 @@ client.on("interactionCreate", async (interaction) => {
       if (!openerId) return interaction.reply({ content: "Couldn't find ticket opener.", ephemeral: true });
 
       const s = getGuildSettings(interaction.guild.id);
-      if (!s.customerRoleId) return interaction.reply({ content: "Set customer role first: /settings set_customer_role role:@Role", ephemeral: true });
+      if (!s.customerRoleId) return interaction.reply({ content: "Set customer role first via /settings → Set Customer Role.", ephemeral: true });
 
       const openerMember = await interaction.guild.members.fetch(openerId).catch(() => null);
       if (!openerMember) return interaction.reply({ content: "Couldn't fetch ticket opener.", ephemeral: true });
@@ -3362,20 +3502,6 @@ client.on("interactionCreate", async (interaction) => {
       return interaction.reply({ content: `✅ Added ${targetUser} to this ticket.` });
     }
 
-    /* ---------- /notification ---------- */
-    if (name === "notification") {
-      const member = await interaction.guild.members.fetch(interaction.user.id).catch(() => null);
-      if (!member || !isAdminOrOwner(member)) {
-        return interaction.reply({ content: "Admins only.", ephemeral: true });
-      }
-
-      const channel = interaction.options.getChannel("channel", true);
-      const s = getGuildSettings(interaction.guild.id);
-      s.notificationChannelId = channel.id;
-      saveSettings();
-
-      return interaction.reply({ content: `✅ Invite backup notifications will be sent to ${channel}.`, ephemeral: true });
-    }
   } catch (e) {
     console.error("interaction error:", e);
     try {
