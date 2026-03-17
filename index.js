@@ -822,9 +822,17 @@ function pickRandomWinners(arr, n) {
   return copy.slice(0, n);
 }
 
+async function getMissingRequiredRoleId(interaction, requiredRoleId) {
+  if (!requiredRoleId) return null;
+  const member = await interaction.guild.members.fetch(interaction.user.id).catch(() => null);
+  if (!member) return requiredRoleId;
+  return member.roles.cache.has(requiredRoleId) ? null : requiredRoleId;
+}
+
 function makeGiveawayEmbed(gw) {
   const endUnix = Math.floor(gw.endsAt / 1000);
   const minInv = gw.minInvites > 0 ? `\nMin invites to join: **${gw.minInvites}**` : "";
+  const reqRole = gw.requiredRoleId ? `\n🔒 Required Role: <@&${gw.requiredRoleId}>` : "";
   const status = gw.ended ? "\n**STATUS: ENDED**" : "";
   return new EmbedBuilder()
     .setTitle(`🎁 GIVEAWAY — ${gw.prize}`)
@@ -835,6 +843,7 @@ function makeGiveawayEmbed(gw) {
         `Entries: **${gw.entries.length}**\n` +
         `Winners: **${gw.winners}**` +
         minInv +
+        reqRole +
         status
     )
     .setFooter({ text: `Giveaway Message ID: ${gw.messageId}` })
@@ -930,6 +939,7 @@ const pendingSOSDMPrompts = new Map();
 function makeSosEmbed(game) {
   const endUnix = Math.floor(game.endsAt / 1000);
   const minInv = game.minInvites > 0 ? `\nMin invites to join: **${game.minInvites}**` : "";
+  const reqRole = game.requiredRoleId ? `\n🔒 Required Role: <@&${game.requiredRoleId}>` : "";
   const status = game.ended ? "\n**STATUS: ENDED**" : "";
   return new EmbedBuilder()
     .setTitle(`🎲 SPLIT OR STEAL — ${game.title}`)
@@ -940,6 +950,7 @@ function makeSosEmbed(game) {
         `Hosted by: <@${game.hostId}>\n` +
         `Entries: **${game.entries.length}**` +
         minInv +
+        reqRole +
         status
     )
     .setFooter({ text: `Split or Steal • Message ID: ${game.messageId}` })
@@ -1653,6 +1664,9 @@ function buildCommandsJSON() {
       .addStringOption((o) => o.setName("prize").setDescription("Prize").setRequired(true))
       .addIntegerOption((o) =>
         o.setName("min_invites").setDescription("Minimum invites needed to join (optional)").setMinValue(0).setRequired(false)
+      )
+      .addRoleOption((o) =>
+        o.setName("required_role").setDescription("Role users must have to join (optional)").setRequired(false)
       ),
 
     new SlashCommandBuilder()
@@ -1677,6 +1691,9 @@ function buildCommandsJSON() {
     .addStringOption((o) => o.setName("duration").setDescription("How long entries are open (e.g. 30m, 1h, 2d)").setRequired(true))
     .addIntegerOption((o) =>
       o.setName("min_invites").setDescription("Minimum invites needed to enter (optional)").setMinValue(0).setRequired(false)
+    )
+    .addRoleOption((o) =>
+      o.setName("required_role").setDescription("Role users must have to join (optional)").setRequired(false)
     );
 
   const redeemCmd = new SlashCommandBuilder()
@@ -2025,6 +2042,13 @@ client.on("interactionCreate", async (interaction) => {
         }
       }
 
+      if (gw.requiredRoleId) {
+        const missingRoleId = await getMissingRequiredRoleId(interaction, gw.requiredRoleId);
+        if (missingRoleId) {
+          return interaction.reply({ content: `❌ You need the <@&${missingRoleId}> role to join this giveaway.`, ephemeral: true });
+        }
+      }
+
       const userId = interaction.user.id;
       const idx = gw.entries.indexOf(userId);
       if (idx === -1) gw.entries.push(userId);
@@ -2053,6 +2077,13 @@ client.on("interactionCreate", async (interaction) => {
         const have = invitesStillInServerForGuild(interaction.guild.id, interaction.user.id);
         if (have < need) {
           return interaction.reply({ content: `❌ Need **${need}** invites. You have **${have}**.`, ephemeral: true });
+        }
+      }
+
+      if (game.requiredRoleId) {
+        const missingRoleId = await getMissingRequiredRoleId(interaction, game.requiredRoleId);
+        if (missingRoleId) {
+          return interaction.reply({ content: `❌ You need the <@&${missingRoleId}> role to join this game.`, ephemeral: true });
         }
       }
 
@@ -3282,6 +3313,7 @@ client.on("interactionCreate", async (interaction) => {
       const winners = interaction.options.getInteger("winners", true);
       const prize = interaction.options.getString("prize", true).trim();
       const minInvites = interaction.options.getInteger("min_invites", false) ?? 0;
+      const requiredRole = interaction.options.getRole("required_role", false);
 
       const ms = parseDurationToMs(durationStr);
       if (!ms) return interaction.reply({ content: "Invalid duration. Use 30m, 1h, 2d, etc.", ephemeral: true });
@@ -3299,6 +3331,7 @@ client.on("interactionCreate", async (interaction) => {
         entries: [],
         ended: false,
         minInvites,
+        requiredRoleId: requiredRole?.id || null,
         lastWinners: [],
       };
 
@@ -3358,6 +3391,7 @@ client.on("interactionCreate", async (interaction) => {
       const prize = interaction.options.getString("prize", true).trim();
       const durationStr = interaction.options.getString("duration", true);
       const minInvites = interaction.options.getInteger("min_invites", false) ?? 0;
+      const requiredRole = interaction.options.getRole("required_role", false);
 
       const ms = parseDurationToMs(durationStr);
       if (!ms) return interaction.reply({ content: "Invalid duration. Use 30m, 1h, 2d, etc.", ephemeral: true });
@@ -3375,6 +3409,7 @@ client.on("interactionCreate", async (interaction) => {
         entries: [],
         ended: false,
         minInvites,
+        requiredRoleId: requiredRole?.id || null,
         players: null,
         responses: {},
         responsesCount: 0,
