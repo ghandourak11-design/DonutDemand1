@@ -547,8 +547,8 @@ async function syncInvitesToBase44() {
   const base44Url = process.env.BASE44_API_URL;
   if (!base44Url) return;
 
-  try {
-    for (const guild of client.guilds.cache.values()) {
+  for (const guild of client.guilds.cache.values()) {
+    try {
       const userIds = Object.keys(invitesData.inviterStats || {});
       const payload = [];
 
@@ -582,10 +582,12 @@ async function syncInvitesToBase44() {
       if (!res.ok) {
         const text = await res.text().catch(() => "");
         console.error(`❌ Base44 sync failed for guild ${guild.id} (${res.status}): ${text.slice(0, 200)}`);
+      } else {
+        console.log(`✅ Base44 sync succeeded for guild ${guild.id} (${payload.length} users)`);
       }
+    } catch (e) {
+      console.error(`❌ Base44 sync error for guild ${guild.id}:`, e?.message || e);
     }
-  } catch (e) {
-    console.error("❌ Base44 sync error:", e?.message || e);
   }
 }
 
@@ -1761,6 +1763,11 @@ function buildCommandsJSON() {
     .setDMPermission(false)
     .addUserOption((o) => o.setName("user").setDescription("User to add to this ticket").setRequired(true));
 
+  const syncInvitesCmd = new SlashCommandBuilder()
+    .setName("syncinvites")
+    .setDescription("Admin: manually sync invite data to the website API.")
+    .setDMPermission(false);
+
   return [
     settingsCmd,
     panelCmd,
@@ -1781,6 +1788,7 @@ function buildCommandsJSON() {
     redeemCmd,
     bidCmd,
     addCmd,
+    syncInvitesCmd,
   ].map((c) => c.toJSON());
 }
 
@@ -1983,6 +1991,8 @@ client.on("guildMemberAdd", async (member) => {
           .catch(() => {});
       }
     }
+
+    syncInvitesToBase44().catch(() => {});
   } catch {}
 });
 
@@ -2000,6 +2010,7 @@ client.on("guildMemberRemove", async (member) => {
       invitesData.invitedMembers[inviterId][member.id].leftAt = Date.now();
     }
     saveInvites();
+    syncInvitesToBase44().catch(() => {});
   } catch {}
 });
 
@@ -2417,6 +2428,7 @@ client.on("interactionCreate", async (interaction) => {
       }
 
       resetInvitesForUser(interaction.user.id);
+      syncInvitesToBase44().catch(() => {});
 
       return interaction.editReply(
         `✅ Your claim was submitted.\nYour invites have been reset and the rewards will be paid to **${mc}** after an admin reviews it.`
@@ -3182,6 +3194,7 @@ client.on("interactionCreate", async (interaction) => {
       const st = ensureInviterStats(user.id);
       st.manual += amount;
       saveInvites();
+      syncInvitesToBase44().catch(() => {});
 
       return interaction.reply({ content: `✅ Added **${amount}** invites to **${user.tag}**.` });
     }
@@ -3195,6 +3208,7 @@ client.on("interactionCreate", async (interaction) => {
 
       const user = interaction.options.getUser("user", true);
       resetInvitesForUser(user.id);
+      syncInvitesToBase44().catch(() => {});
 
       return interaction.reply({ content: `✅ Reset invite stats for **${user.tag}**.` });
     }
@@ -3211,8 +3225,31 @@ client.on("interactionCreate", async (interaction) => {
       invitesData.inviteOwners = {};
       invitesData.invitedMembers = {};
       saveInvites();
+      syncInvitesToBase44().catch(() => {});
 
       return interaction.reply({ content: "✅ Reset invite stats for **everyone** in this server.", ephemeral: true });
+    }
+
+    /* ---------- /syncinvites ---------- */
+    if (name === "syncinvites") {
+      const member = await interaction.guild.members.fetch(interaction.user.id).catch(() => null);
+      if (!member || !isAdminOrOwner(member)) {
+        return interaction.reply({ content: "Admins only.", ephemeral: true });
+      }
+
+      await interaction.deferReply({ ephemeral: true });
+
+      const base44Url = process.env.BASE44_API_URL;
+      if (!base44Url) {
+        return interaction.editReply("❌ BASE44_API_URL is not configured in environment variables.");
+      }
+
+      try {
+        await syncInvitesToBase44();
+        return interaction.editReply("✅ Invite data synced to the website API.");
+      } catch (e) {
+        return interaction.editReply(`❌ Sync failed: ${String(e?.message || e).slice(0, 1000)}`);
+      }
     }
 
     /* ---------- /link ---------- */
@@ -3593,8 +3630,13 @@ client.on("interactionCreate", async (interaction) => {
   } catch (e) {
     console.error("interaction error:", e);
     try {
-      if (interaction?.isRepliable?.() && !interaction.replied && !interaction.deferred) {
-        await interaction.reply({ content: "Error handling that interaction.", ephemeral: true });
+      if (interaction?.isRepliable?.()) {
+        const msg = { content: "❌ Something went wrong processing your request.", ephemeral: true };
+        if (interaction.deferred || interaction.replied) {
+          await interaction.followUp(msg).catch(() => {});
+        } else {
+          await interaction.reply(msg).catch(() => {});
+        }
       }
     } catch {}
   }
