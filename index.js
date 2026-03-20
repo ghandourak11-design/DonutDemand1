@@ -543,6 +543,52 @@ function doBackupInvites() {
   return snapshot;
 }
 
+async function syncInvitesToBase44() {
+  const base44Url = process.env.BASE44_API_URL;
+  if (!base44Url) return;
+
+  try {
+    for (const guild of client.guilds.cache.values()) {
+      const userIds = Object.keys(invitesData.inviterStats || {});
+      const payload = [];
+
+      for (const userId of userIds) {
+        let member;
+        try {
+          member = await guild.members.fetch(userId);
+        } catch {
+          continue; // member not in this guild, skip gracefully
+        }
+
+        const count = invitesStillInServerForGuild(guild.id, userId);
+        payload.push({
+          username: member.user.username,
+          displayName: member.displayName,
+          odiscordId: userId,
+          invites: count,
+          guildId: guild.id,
+          guildName: guild.name,
+        });
+      }
+
+      if (!payload.length) continue;
+
+      const res = await fetch(`${base44Url}/invite`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+
+      if (!res.ok) {
+        const text = await res.text().catch(() => "");
+        console.error(`❌ Base44 sync failed for guild ${guild.id} (${res.status}): ${text.slice(0, 200)}`);
+      }
+    }
+  } catch (e) {
+    console.error("❌ Base44 sync error:", e?.message || e);
+  }
+}
+
 async function doAutoBackupInvites() {
   const snapshot = sanitizeInvitesDataForSave(invitesData);
   saveJson(INVITES_AUTO_BACKUP_FILE, snapshot);
@@ -1830,6 +1876,13 @@ client.once("ready", async () => {
   // Auto-backup invites every hour
   doAutoBackupInvites().catch(() => {});
   setInterval(() => doAutoBackupInvites().catch(() => {}), 60 * 60 * 1000);
+
+  // Base44 invite sync every 60 seconds
+  if (process.env.BASE44_API_URL) {
+    syncInvitesToBase44().catch(() => {});
+    setInterval(() => syncInvitesToBase44().catch(() => {}), 60 * 1000);
+    console.log("✅ Base44 invite sync started (every 60s)");
+  }
 });
 
 client.on("guildCreate", async (guild) => {
